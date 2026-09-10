@@ -2,6 +2,8 @@ const std = @import("std");
 const crypto_mod = @import("../crypto.zig");
 const transport = @import("transport.zig");
 const HttpRuntime = @import("runtime.zig").HttpRuntime;
+const tracing = @import("../tracing/root.zig");
+const trace_http = @import("../tracing/http.zig");
 
 const Request = transport.Request;
 const Response = transport.Response;
@@ -90,6 +92,7 @@ pub const HttpPolicy = struct {
 pub const HttpPipeline = struct {
     policies: []*HttpPolicy,
     runtime: HttpRuntime,
+    instrumentation: ?tracing.InstrumentationOptions = null,
 
     pub fn init(runtime: HttpRuntime, policies: []*HttpPolicy) HttpPipeline {
         return .{
@@ -98,9 +101,22 @@ pub const HttpPipeline = struct {
         };
     }
 
+    /// Configure once before copying the pipeline into clients. Provider,
+    /// scope strings, and default-parent tracestate must outlive those copies.
+    pub fn setInstrumentation(self: *HttpPipeline, options: ?tracing.InstrumentationOptions) void {
+        self.instrumentation = options;
+    }
+
     pub fn send(self: *HttpPipeline, request: *Request) !Response {
         request.transport_started = false;
-        return callNext(request, self.policies, self.runtime);
+        var scope = trace_http.Scope.begin(request, self.instrumentation);
+        defer scope.end();
+        const response = callNext(request, self.policies, self.runtime) catch |err| {
+            scope.recordError(err);
+            return err;
+        };
+        scope.recordResponse(response.status_code);
+        return response;
     }
 
     /// Opens a streaming operation through the same ordered policy chain used
@@ -112,7 +128,14 @@ pub const HttpPipeline = struct {
     ) !*HttpOperation {
         request.transport_started = false;
         try checkOpenCancelled(options);
-        return callNextOpen(request, options, self.policies, self.runtime);
+        var scope = trace_http.Scope.begin(request, self.instrumentation);
+        defer scope.end();
+        const operation = callNextOpen(request, options, self.policies, self.runtime) catch |err| {
+            scope.recordError(err);
+            return err;
+        };
+        scope.recordResponse(operation.status_code);
+        return operation;
     }
 };
 
@@ -541,15 +564,9 @@ pub const RequestIdPolicy = struct {
     }
 };
 
-/// Creates a tracing span around each HTTP request with standard attributes.
-///
-/// When a `TracerProvider` is configured, creates spans with:
-/// - `http.method`, `url.full`, `http.status_code`
-/// - `az.client_request_id` (if present)
-/// - W3C `traceparent` / `tracestate` header propagation
+/// Legacy manually placed tracing policy. Automatic pipeline instrumentation
+/// supersedes it without double spans. URLs and headers are never attributes.
 pub const TracingPolicy = struct {
-    const tracing = @import("../tracing/root.zig");
-
     tracer: *tracing.Tracer,
     az_namespace: []const u8,
     policy: HttpPolicy,
@@ -573,6 +590,7 @@ pub const TracingPolicy = struct {
         runtime: HttpRuntime,
     ) !Response {
         const self: *TracingPolicy = @alignCast(@fieldParentPtr("policy", policy));
+        if (request.context.tracing_suppressed) return callNext(request, next, runtime);
 
         const span = self.tracer.startSpan("HTTP", .client) catch {
             return callNext(request, next, runtime);
@@ -580,12 +598,8 @@ pub const TracingPolicy = struct {
 
         // Set standard Azure SDK span attributes.
         span.setAttribute("http.method", @tagName(request.method)) catch {};
-        span.setAttribute("url.full", request.url) catch {};
         span.setAttribute("az.namespace", self.az_namespace) catch {};
-
-        if (request.getHeader("x-ms-client-request-id")) |rid| {
-            span.setAttribute("az.client_request_id", rid) catch {};
-        }
+        trace_http.safeAttributes(span, request, self.az_namespace);
 
         // Execute the rest of the pipeline.
         const response = callNext(request, next, runtime) catch |err| {
@@ -613,11 +627,12 @@ pub const TracingPolicy = struct {
         runtime: HttpRuntime,
     ) !*HttpOperation {
         const self: *TracingPolicy = @alignCast(@fieldParentPtr("policy", policy));
+        if (request.context.tracing_suppressed) return callNextOpen(request, options, next, runtime);
         const span = self.tracer.startSpan("HTTP", .client) catch
             return callNextOpen(request, options, next, runtime);
         span.setAttribute("http.method", @tagName(request.method)) catch {};
-        span.setAttribute("url.full", request.url) catch {};
         span.setAttribute("az.namespace", self.az_namespace) catch {};
+        trace_http.safeAttributes(span, request, self.az_namespace);
         const operation = callNextOpen(request, options, next, runtime) catch |err| {
             span.setStatus(.@"error");
             span.end();
@@ -1103,7 +1118,6 @@ test "isRetryable status codes" {
 
 test "TracingPolicy creates span with attributes" {
     const allocator = std.testing.allocator;
-    const tracing = @import("../tracing/root.zig");
     var mock = transport.MockTransport.init(allocator, 200, "ok");
     defer mock.deinit();
 
@@ -1131,7 +1145,6 @@ test "TracingPolicy creates span with attributes" {
 
 test "TracingPolicy sets error status on failure" {
     const allocator = std.testing.allocator;
-    const tracing = @import("../tracing/root.zig");
     var mock = transport.MockTransport.init(allocator, 500, "error");
     defer mock.deinit();
 
@@ -1149,4 +1162,8 @@ test "TracingPolicy sets error status on failure" {
 
     try std.testing.expectEqual(tracing.SpanStatus.@"error", rec_tracer.last_span.?.status);
     try std.testing.expect(rec_tracer.last_span.?.ended);
+}
+
+test {
+    _ = @import("../tracing/http_test.zig");
 }

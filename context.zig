@@ -7,6 +7,11 @@ pub const Context = struct {
     cancelled: bool = false,
     trace_id: ?[32]u8 = null,
     span_id: ?[16]u8 = null,
+    trace_flags: u8 = 0,
+    /// Borrowed until the operation starts; the concrete tracer copies it.
+    trace_state: ?[]const u8 = null,
+    /// Use for exporter requests on a shared instrumented pipeline.
+    tracing_suppressed: bool = false,
 
     pub const none = Context{};
 
@@ -20,10 +25,25 @@ pub const Context = struct {
 
     /// Create a child context inheriting trace context.
     pub fn withTrace(self: Context, trace_id: [32]u8, span_id: [16]u8) Context {
+        var result = self;
+        result.trace_id = trace_id;
+        result.span_id = span_id;
+        return result;
+    }
+
+    pub fn withTraceContext(self: Context, trace: @import("tracing/trace_context.zig").TraceContext) Context {
+        var result = self.withTrace(trace.trace_id, trace.span_id);
+        result.trace_flags = trace.trace_flags;
+        result.trace_state = trace.trace_state;
+        return result;
+    }
+
+    pub fn traceContext(self: Context) ?@import("tracing/trace_context.zig").TraceContext {
         return .{
-            .cancelled = self.cancelled,
-            .trace_id = trace_id,
-            .span_id = span_id,
+            .trace_id = self.trace_id orelse return null,
+            .span_id = self.span_id orelse return null,
+            .trace_flags = self.trace_flags,
+            .trace_state = self.trace_state,
         };
     }
 };

@@ -47,6 +47,10 @@ pub const Request = struct {
     /// Best-effort budget checked before attempts and retry backoff. A blocking
     /// in-flight send can exceed this budget.
     operation_timeout_ms: ?u64 = null,
+    /// Per-call trace parent/suppression. HTTP cancellation still uses OpenOptions.
+    context: @import("../context.zig").Context = .none,
+    /// Managed by tracing during dispatch; controls cross-origin header stripping.
+    tracing_headers_managed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, method: Method, request_url: []const u8) Request {
         return .{
@@ -658,6 +662,9 @@ const OwnedRedirectRequest = struct {
         var headers = source.headers.iterator();
         while (headers.next()) |header| {
             if (isRedirectOmittedHeader(header.key_ptr.*, cross_origin)) continue;
+            if (cross_origin and source.tracing_headers_managed and
+                (std.ascii.eqlIgnoreCase(header.key_ptr.*, "traceparent") or
+                    std.ascii.eqlIgnoreCase(header.key_ptr.*, "tracestate"))) continue;
             if (drop_body and isBodyHeader(header.key_ptr.*)) continue;
             try self.request.setHeader(header.key_ptr.*, header.value_ptr.*);
         }
@@ -665,6 +672,8 @@ const OwnedRedirectRequest = struct {
         self.request.retryable = source.retryable;
         self.request.redirect_policy = source.redirect_policy;
         self.request.operation_timeout_ms = source.operation_timeout_ms;
+        self.request.context = source.context;
+        self.request.tracing_headers_managed = source.tracing_headers_managed;
         return self;
     }
 
