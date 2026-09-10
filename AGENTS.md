@@ -63,4 +63,5 @@ Branch-owned source (including `azure_sdk_core` on `sdk/core`,
 - Hardcode credentials or secrets.
 - Break public API signatures without justification.
 - Skip `zig fmt`.
-- Modify remote package refs outside the sealed reset/cutover workflow.
+- Modify remote package refs outside the sealed reset/cutover or approved
+  expected-absent branch-native bootstrap workflow.
