@@ -1200,28 +1200,40 @@ test "ContainerClient createItem" {
     var ctr = db.container("myctr");
     try ctr.createItem(allocator, .{
         .id = "item1",
-        .partition_key = "[\"pk1\"]",
+        .partition_key = "[ \"pk1\" ]",
         .body =
         \\{"id":"item1","pk":"pk1","name":"test"}
         ,
     });
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
     try std.testing.expectEqual(core.http.Method.POST, mock.last_method.?);
     try std.testing.expect(std.mem.endsWith(u8, mock.last_url.?, "/docs"));
+    try std.testing.expectEqualStrings(
+        "[ \"pk1\" ]",
+        mock.last_headers.get("x-ms-documentdb-partitionkey").?,
+    );
 }
 
 test "ContainerClient readItem" {
     const allocator = std.testing.allocator;
-    var mock = core.http.MockTransport.init(allocator, 200,
-        \\{"id":"item1","pk":"pk1","name":"test"}
-    );
+    const expected_body =
+        \\{ "id": "item1", "values": [1e+02,9007199254740993], "name": "\u0074est" }
+    ;
+    var mock = core.http.MockTransport.init(allocator, 200, expected_body);
     defer mock.deinit();
     var client = try createTestClient(&mock);
     defer client.deinit();
     var db = client.database("mydb");
     var ctr = db.container("myctr");
-    const body = try ctr.readItem(allocator, "item1", "[\"pk1\"]");
+    const body = try ctr.readItem(allocator, "item1", "[ \"pk1\" ]");
     defer allocator.free(body);
-    try std.testing.expect(std.mem.find(u8, body, "\"name\":\"test\"") != null);
+    try std.testing.expectEqualStrings(expected_body, body);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+    try std.testing.expectEqual(core.http.Method.GET, mock.last_method.?);
+    try std.testing.expectEqualStrings(
+        "[ \"pk1\" ]",
+        mock.last_headers.get("x-ms-documentdb-partitionkey").?,
+    );
 }
 
 test "ContainerClient upsertItem" {
@@ -1260,7 +1272,7 @@ test "ContainerClient deleteItem" {
 test "ContainerClient queryItems" {
     const allocator = std.testing.allocator;
     var mock = core.http.MockTransport.init(allocator, 200,
-        \\{"Documents":[{"id":"a","val":1},{"id":"b","val":2}],"_count":2}
+        \\{"Documents":[{"id":"a","val":1e+02},{"id":"b","val":9007199254740993}],"_count":2}
     );
     defer mock.deinit();
     var client = try createTestClient(&mock);
@@ -1270,7 +1282,12 @@ test "ContainerClient queryItems" {
     var result = try ctr.queryItems(allocator, "SELECT * FROM c");
     defer result.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), result.documents.len);
-    try std.testing.expect(std.mem.find(u8, result.documents[0], "\"id\":\"a\"") != null);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"val\":1e+02}", result.documents[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"val\":9007199254740993}", result.documents[1]);
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+    try std.testing.expectEqual(core.http.Method.POST, mock.last_method.?);
+    try std.testing.expectEqualStrings("true", mock.last_headers.get("x-ms-documentdb-isquery").?);
+    try std.testing.expectEqualStrings("100", mock.last_headers.get("x-ms-max-item-count").?);
 }
 
 test "ContainerClient readItem 404" {
@@ -1580,6 +1597,24 @@ test "non-idempotent creates are not replayed after transport starts" {
         client.createDatabase(allocator, "testdb"),
     );
     try std.testing.expectEqual(@as(usize, 1), transport.calls);
+
+    var database = client.database("testdb");
+    try std.testing.expectError(
+        error.CosmosCreateOutcomeUnknown,
+        database.createContainer(allocator, "testcontainer", "/pk"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), transport.calls);
+
+    var container = database.container("testcontainer");
+    try std.testing.expectError(
+        error.CosmosCreateOutcomeUnknown,
+        container.createItem(allocator, .{
+            .id = "item1",
+            .partition_key = "[\"pk1\"]",
+            .body = "{\"id\":\"item1\",\"pk\":\"pk1\"}",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 3), transport.calls);
 }
 
 test "non-idempotent creates do not follow 307 or 308 redirects" {
@@ -1706,12 +1741,13 @@ test "crypto provider failure is atomic before authentication and send" {
 
 test "query continuation comes from the response header" {
     const allocator = std.testing.allocator;
+    const header_token = "opaque%2B/+==:[]";
     var transport = core.http.MockTransport.init(allocator, 200,
         \\{"Documents":[{"id":"a"}],"_continuation":"body-token"}
     );
     defer transport.deinit();
     const headers = [_]core.http.MockTransport.HeaderPair{
-        .{ .name = "x-ms-continuation", .value = "header-token" },
+        .{ .name = "x-ms-continuation", .value = header_token },
     };
     transport.response_headers_list = &headers;
     var client = try createTestClient(&transport);
@@ -1722,9 +1758,10 @@ test "query continuation comes from the response header" {
     var result = try container.queryItems(allocator, "SELECT * FROM c");
     defer result.deinit(allocator);
     try std.testing.expectEqualStrings(
-        "header-token",
+        header_token,
         result.continuation_token.?,
     );
+    try std.testing.expectEqual(@as(usize, 1), transport.call_count);
 }
 
 test "continuation replacement preserves the old token on allocation failure" {
