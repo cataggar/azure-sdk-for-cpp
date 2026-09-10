@@ -34,31 +34,9 @@ jobs:
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Validate hosted verification support
+      - name: Validate package metadata and history
+        run: zig build package-check package-history-check --summary all
+
+      - name: Verify branch-owned package
         shell: bash
-        run: |
-          case "$PACKAGE" in
-            azure_sdk_core_tracing|azure_sdk_core_perf|azure_sdk_core_amqp|azure_sdk_core|azure_sdk_core_testing)
-              ;;
-            *)
-              echo "::error::$PACKAGE is branch-owned. Run scripts/package-branch-release.sh verify $PACKAGE instead."
-              exit 1
-              ;;
-          esac
-
-      - name: Configure release commit identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Validate package metadata
-        run: zig build package-check --summary all
-
-      - name: Verify release stage
-        run: scripts/package-release.sh verify "$PACKAGE"
-
-      - name: Prepare sealed release stage
-        run: scripts/package-release.sh prepare "$PACKAGE"
-
-      - name: Validate prospective publication
-        run: scripts/package-release.sh publish "$PACKAGE" --dry-run
+        run: scripts/package-branch-release.sh verify "$PACKAGE"

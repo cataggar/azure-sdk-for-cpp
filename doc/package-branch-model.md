@@ -103,4 +103,5 @@ Package tags are lightweight refs named:
 
 For branch-owned packages, releasing creates only the new tag at the already
 reviewed branch tip. Release tooling does not synthesize or advance the package
-branch. Core packages retain the staged snapshot release process from `main`.
+branch. This includes Core-family packages; no package currently uses the
+staged Main-owned release process. See [Releasing Packages](releasing-packages.md).
