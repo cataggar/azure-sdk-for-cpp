@@ -83,18 +83,109 @@ const crypto_contracts = core_dep.module("azure_sdk_core_crypto_conformance");
 HTTP factories publish explicit capabilities for streaming, response-header
 ordering, framing validation, response limits, cancellation grade,
 decompression ownership, lifecycle observation, and bounded-memory
-logical-large uploads. Crypto factories publish incremental-allocation and
+logical-large uploads/downloads. Crypto factories publish incremental-allocation and
 concurrency guarantees. A skipped capability is not evidence of runtime
 support.
 
-Core CI runs the raw transport suite against `StdHttpTransport` and
-`MockTransport`, the pipeline and allocation-failure suites against reusable
-fakes, and the crypto suite against `StdCryptoProvider`. The standard
-transport is caller-serialized; the standard SDK crypto provider supports
-concurrent hash/HMAC calls. CI also archives exactly the manifest `.paths`,
+Core runs the raw transport suite against `StdHttpTransport` and
+`MockTransport`, retains the fake redirect/retry/allocation contracts, and runs
+actual standard-backend attempt and allocation-failure contracts. The crypto
+suite uses `StdCryptoProvider`. The standard transport remains
+caller-serialized; the standard SDK crypto provider supports concurrent
+hash/HMAC calls. CI also archives exactly the manifest `.paths`,
 fetches that archive into a separate consumer package, and resolves all three
 modules through `b.dependency`; omitted package files therefore fail the
 package test.
+
+### HTTP factory integration
+
+Existing runner signatures, the three `CancellationGrade` tags, and required
+factory/instance fields are unchanged. New fields default to unsupported/null.
+Adapters opt in only when their fixture implements the associated contract:
+
+- **`scripted_attempts`**: honor `BackendOptions.responses`, serving successive
+  responses at the same endpoint, and implement `BackendInstance.attemptFn`.
+  Each observation includes the method/path request line, body prefix and
+  length, credential headers, and `X-Conformance-Policy`. Record requests at
+  the peer, not just descriptor invocations: invisible backend retries must
+  fail the contract. `finish` must stop an unused scripted endpoint without
+  waiting for a request. An exhausted script must respond deterministically
+  (Core's server returns 418), not leave an extra attempt blocked.
+- The actual-backend suite asserts no raw retry, exactly one configured retry,
+  the retry ceiling, `retryable=false`, one-shot suppression, exact rewind
+  counts/errors, and policy invocation counts outside/inside the retry policy.
+  It also checks forbidden redirects, one-shot redirects, and rejection of
+  plaintext redirect targets before a destination request.
+- **`https_redirects`**, together with `scripted_attempts`: provide distinct,
+  trusted **HTTPS** endpoints. This additionally enables successful same-origin
+  and cross-origin redirects, credential stripping/preservation, fragment
+  removal, cross-origin Host replacement, 303 body/method rewriting, and
+  rewind-failure cleanup. Core's
+  standard fixture is HTTP loopback and does **not** claim this capability.
+  Existing fake positive redirect tests remain separate evidence. No test
+  weakens Core's HTTPS redirect requirement or substitutes for TLS trust tests.
+- **`bounded_memory_logical_large_upload` /
+  `bounded_memory_logical_large_download`**: honor `fixture_allocator` for
+  peer/harness allocations, while every backend/context/operation allocation
+  uses the allocator supplied to `createFn`. Each transfer gets a fixed
+  **2 MiB cumulative allocation budget**, independent of the generated
+  **32 MiB + 257-byte** body. Uploads cover known-length and chunked framing,
+  retaining a 4096-byte prefix and a seed-zero `std.hash.Wyhash` of the entire
+  received body in `Observation.body_hash`. Downloads honor
+  `Response.generated_body`, validate every byte and exact length, and exercise
+  full consumption, partial-read `finish` drainage, and early abort with both
+  framings. The buffered-response limit must not truncate streaming reads.
+- The wide-upload framing case advertises **4 GiB + 65537 bytes** but sends
+  only 65537 bytes, expecting `RequestBodyTooShort` and an unchanged wire
+  `Content-Length`. This is a width/framing test, **not a multi-GiB transfer**.
+  `finish` currently drains to EOF; these tests do not claim an independent
+  drain-byte ceiling or interruption of a blocked drain.
+- **`allocation_failure_cleanup`**: implement `allocationFixtureFn` and invoke
+  `runBackendAllocationFailureContracts(allocator, io, factory)`. It exhaustively
+  fails allocations in buffered, finish, abort, redirect, and retry scenarios.
+  `runBackendAllocationScenario` is a reusable implementation for that hook;
+  adapters must additionally account for native handles/pools and normalize
+  allocator-caused wrapper errors to `OutOfMemory`. The peer uses the separate
+  fixture allocator, never the failing allocator on a second thread. Without
+  HTTPS fixtures, the redirect scenario proves rejection-path cleanup only.
+  The original zero-argument `runAllocationFailureContracts()` still tests
+  **fakes only**.
+- **`assertQuiescentFn`** optionally verifies adapter-native resources after
+  operation teardown, including failed allocation paths. The standard factory
+  checks one remaining transport reference, no leased connections, and no
+  idle connections for the server's `Connection: close` responses. Lifecycle
+  counters, when advertised, must distinguish exactly one finish/abort/cancel
+  and one deinit; deinitializing an active operation aborts it once. These
+  counters also check intermediate retry/redirect cleanup. Counters belong to
+  the transport context that dispatched the operations, even when the peer
+  URL changes; peer request counts belong to each endpoint. These close-only
+  fixtures do not certify keep-alive pool reuse.
+
+### Stronger interruption evidence
+
+`Capabilities.interruption` has independent `token` and `deadline` phase sets:
+`connect`, `upload_read`, `upload_write`, `response_headers`, `response_body`,
+and `finish_drain`. Blocking caller-reader interruption is deliberately
+separate from interrupting an upload socket write.
+Populate them with `InterruptionPhases.initMany(...)` (or `insert`) only when
+the adapter implements `interruptionFixtureFn`. `runRawTransportContracts`
+invokes `runInterruptionContracts` automatically; either runner rejects a
+claimed phase without its integration hook.
+
+The adapter-local fixture must synchronize entry into a genuinely blocked
+phase, then signal the token or expire a deadline, measure completion within
+1000 ms of that trigger, and return `InterruptionEvidence`. It must use a
+bounded watchdog and join/clean up even on failure. Evidence must report the
+original `OperationCancelled` or `OperationTimedOut` outcome, a started
+transport, exactly one cleanup, zero live operations, and zero leased
+connections. Preflight cancellation, a late success, or cleanup after manually
+unblocking the phase is not proof of interruption.
+
+Standard Core still advertises only `cooperative_upload`; its stronger phase
+sets are empty. WASI gains no cancellation/runtime claim. Adapter/TLS trust
+fixtures, HTTPX and native SymCrypt composition, service-client provider
+selection, and the final supported-target/release matrix remain separate
+integration work.
 
 The WASI HTTP implementation separates target-neutral request adaptation from
 the `wasi:http@0.2.6` host externs. Native tests use an injectable fake host for
