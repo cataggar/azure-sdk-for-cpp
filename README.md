@@ -172,8 +172,14 @@ the caller must `deinit`; taking also clears the session slot. Every open
 attempt clears the prior value before doing any allocation, and a successful
 open leaves it empty, so diagnostics cannot leak across retries or link names.
 Sessions and their diagnostic access are caller serialized, like the rest of
-the synchronous link API. Conditions are deliberately not interpreted by this
-package; service clients may map conditions they understand.
+the synchronous link API: keep an open and its diagnostic inspection or take
+in the same serialized operation. Independent sessions do not share diagnostic
+slots; this does not make simultaneous operations on one session or driver
+thread safe. A taken diagnostic survives session/driver destruction, provided
+the session allocator remains valid until the diagnostic is deinitialized.
+Do not copy an owned diagnostic and deinitialize both copies. Conditions are
+deliberately not interpreted by this package; service clients may map
+conditions they understand.
 
 `delivery` stays valid until the next `receive` returns, so copy anything you
 need to keep. Prefetched deliveries queue up and are drained with a cursor

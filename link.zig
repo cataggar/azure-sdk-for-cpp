@@ -73,8 +73,10 @@ pub const Rejection = struct {
 /// Structured remote diagnostics retained when a link-open attempt fails.
 ///
 /// A value returned by `Session.takeFailedLinkOpen` belongs to the caller and
-/// remains valid until `deinit` is called. Diagnostics are service agnostic;
-/// callers interpret the peer-defined condition and info fields.
+/// survives session and driver destruction. Its allocator must remain valid
+/// until `deinit` is called; copying the value does not duplicate ownership.
+/// Diagnostics are service agnostic; callers interpret the peer-defined
+/// condition and info fields.
 pub const FailedLinkOpen = struct {
     allocator: Allocator,
     remote_error: connection.RemoteError,
@@ -202,7 +204,8 @@ pub const Session = struct {
     ///
     /// The returned pointer remains valid until the next link-open attempt,
     /// `takeFailedLinkOpen`, or session deinitialization. Session operations
-    /// are caller serialized.
+    /// are caller serialized: keep an open and its diagnostic inspection or
+    /// ownership transfer in the same serialized operation.
     pub fn failedLinkOpen(self: *const Session) ?*const FailedLinkOpen {
         return if (self.failed_link_open) |*diagnostic| diagnostic else null;
     }
@@ -3092,6 +3095,303 @@ fn pushRefusedAttach(
         .target = if (kind == .receiver) .{} else null,
         .initial_delivery_count = if (kind == .receiver) 0 else null,
     } });
+}
+
+fn pushDiagnosticRefusal(
+    peer: Peer,
+    kind: RefusedLinkKind,
+    name: []const u8,
+    err: perf.AmqpError,
+) !void {
+    try pushRefusedAttach(peer, kind, name, 40);
+    try peer.push(0, .{ .detach = .{
+        .handle = 40,
+        .closed = true,
+        .err = err,
+    } });
+}
+
+fn openDiagnosticTestLink(session: *Session, kind: RefusedLinkKind, name: []const u8) LinkError!void {
+    switch (kind) {
+        .sender => _ = try openSender(session, .{
+            .name = name,
+            .target_address = "entity",
+        }, 10_000),
+        .receiver => _ = try openReceiver(session, .{
+            .name = name,
+            .source_address = "entity",
+            .prefetch = 0,
+        }, 10_000),
+    }
+}
+
+fn expectDiagnosticRefusal(session: *Session, kind: RefusedLinkKind, name: []const u8) !void {
+    openDiagnosticTestLink(session, kind, name) catch |err| {
+        if (err == error.LinkDetached) return;
+        return err;
+    };
+    return error.TestUnexpectedResult;
+}
+
+test "caller serialized opens keep independent session diagnostics isolated" {
+    const allocator = testing.allocator;
+    var first_mem = MemoryTransport.init(allocator);
+    defer first_mem.deinit();
+    var second_mem = MemoryTransport.init(allocator);
+    defer second_mem.deinit();
+    var first_clock: connection.ManualClock = .{};
+    var second_clock: connection.ManualClock = .{};
+    const first_peer = Peer{ .allocator = allocator, .mem = &first_mem };
+    const second_peer = Peer{ .allocator = allocator, .mem = &second_mem };
+    try scriptHandshake(first_peer, 65536);
+    try scriptHandshake(second_peer, 65536);
+
+    var first_driver = try Driver.init(allocator, first_mem.transport(), first_clock.clock(), test_options);
+    defer first_driver.deinit();
+    var second_driver = try Driver.init(allocator, second_mem.transport(), second_clock.clock(), test_options);
+    defer second_driver.deinit();
+    var first = try Fixture.init(allocator, &first_mem, &first_clock, &first_driver);
+    defer first.deinit();
+    var second = try Fixture.init(allocator, &second_mem, &second_clock, &second_driver);
+    defer second.deinit();
+
+    // Reuse both the link name and remote handle on independent connections.
+    try pushDiagnosticRefusal(first_peer, .sender, "link", .{ .condition = "amqp:unauthorized-access" });
+    try expectDiagnosticRefusal(&first.session, .sender, "link");
+    const first_borrowed = first.session.failedLinkOpen().?;
+    try testing.expect(second.session.failedLinkOpen() == null);
+
+    try pushDiagnosticRefusal(second_peer, .receiver, "link", .{ .condition = "amqp:not-found" });
+    try expectDiagnosticRefusal(&second.session, .receiver, "link");
+    const second_borrowed = second.session.failedLinkOpen().?;
+    try testing.expectEqualStrings("amqp:unauthorized-access", first_borrowed.condition());
+    try testing.expectEqualStrings("amqp:not-found", second_borrowed.condition());
+
+    var taken = first.session.takeFailedLinkOpen().?;
+    defer taken.deinit();
+    try testing.expect(first.session.takeFailedLinkOpen() == null);
+    try testing.expectEqualStrings("amqp:not-found", second_borrowed.condition());
+
+    try pushDiagnosticRefusal(first_peer, .receiver, "link", .{ .condition = "amqp:resource-limit-exceeded" });
+    try expectDiagnosticRefusal(&first.session, .receiver, "link");
+    try testing.expectEqualStrings("amqp:resource-limit-exceeded", first.session.failedLinkOpen().?.condition());
+    try testing.expectEqualStrings("amqp:not-found", second_borrowed.condition());
+
+    try second_peer.push(0, .{ .attach = .{
+        .name = "link",
+        .handle = 41,
+        .role = .receiver,
+    } });
+    try openDiagnosticTestLink(&second.session, .sender, "link");
+    try testing.expect(second.session.failedLinkOpen() == null);
+    try testing.expectEqualStrings("amqp:resource-limit-exceeded", first.session.failedLinkOpen().?.condition());
+
+    try first_peer.push(0, .{ .attach = .{
+        .name = "link",
+        .handle = 41,
+        .role = .sender,
+        .initial_delivery_count = 0,
+    } });
+    try openDiagnosticTestLink(&first.session, .receiver, "link");
+    try testing.expect(first.session.failedLinkOpen() == null);
+    try testing.expectEqualStrings("amqp:unauthorized-access", taken.condition());
+    try testing.expect(!first.session.ended and !second.session.ended);
+}
+
+const diagnostic_test_payload = "nested diagnostic payload" ** 64;
+const diagnostic_test_map = [_]uamqp.MapEntry{
+    .{ .key = .{ .symbol = "payload" }, .value = .{ .binary = diagnostic_test_payload } },
+    .{ .key = .{ .string = "reason" }, .value = .{ .symbol = "unavailable" } },
+};
+const diagnostic_test_list = [_]uamqp.AmqpValue{
+    .{ .string = "context" },
+    .{ .map = @constCast(&diagnostic_test_map) },
+};
+const diagnostic_test_info = [_]uamqp.MapEntry{.{
+    .key = .{ .symbol = "details" },
+    .value = .{ .list = @constCast(&diagnostic_test_list) },
+}};
+const diagnostic_test_error = perf.AmqpError{
+    .condition = "amqp:not-found",
+    .description = "current refusal",
+    .info = &diagnostic_test_info,
+};
+
+fn expectNestedDiagnostic(diagnostic: FailedLinkOpen) !void {
+    try testing.expectEqualStrings(diagnostic_test_error.condition, diagnostic.condition());
+    try testing.expectEqualStrings(diagnostic_test_error.description.?, diagnostic.description().?);
+    const info = diagnostic.info().?;
+    try testing.expectEqual(@as(usize, 1), info.len);
+    try testing.expectEqualStrings("details", info[0].key.symbol);
+    const list = info[0].value.list;
+    try testing.expectEqual(@as(usize, 2), list.len);
+    try testing.expectEqualStrings("context", list[0].string);
+    const map = list[1].map;
+    try testing.expectEqual(@as(usize, 2), map.len);
+    try testing.expectEqualStrings("payload", map[0].key.symbol);
+    try testing.expectEqualStrings(diagnostic_test_payload, map[0].value.binary);
+    try testing.expectEqualStrings("reason", map[1].key.string);
+    try testing.expectEqualStrings("unavailable", map[1].value.symbol);
+}
+
+fn refusedOpenUnderAllocator(allocator: Allocator, kind: RefusedLinkKind) !void {
+    var taken: ?FailedLinkOpen = null;
+    defer if (taken) |*diagnostic| diagnostic.deinit();
+    {
+        // Peer scripting is not part of the client's allocation-failure sweep.
+        var mem = MemoryTransport.init(testing.allocator);
+        defer mem.deinit();
+        var clock: connection.ManualClock = .{};
+        const peer = Peer{ .allocator = testing.allocator, .mem = &mem };
+        try scriptHandshake(peer, 65536);
+        var options = test_options;
+        options.max_frame_size = 65536;
+        var driver = try Driver.init(allocator, mem.transport(), clock.clock(), options);
+        defer driver.deinit();
+        var fixture = try Fixture.init(allocator, &mem, &clock, &driver);
+        defer fixture.deinit();
+
+        try pushDiagnosticRefusal(peer, kind, "old", .{ .condition = "amqp:old-error" });
+        try expectDiagnosticRefusal(&fixture.session, kind, "old");
+        try testing.expect(fixture.session.failedLinkOpen() != null);
+
+        try pushDiagnosticRefusal(peer, kind, "refused", diagnostic_test_error);
+        mem.clearWritten();
+        const result = if (openDiagnosticTestLink(&fixture.session, kind, "refused"))
+            return error.TestUnexpectedResult
+        else |err|
+            err;
+        try testing.expectEqual(@as(usize, 0), fixture.session.senders.items.len);
+        try testing.expectEqual(@as(usize, 0), fixture.session.receivers.items.len);
+        try testing.expectEqual(@as(u32, 0), fixture.session.incoming_deliveries.count());
+        if (fixture.session.failedLinkOpen()) |diagnostic| {
+            try expectNestedDiagnostic(diagnostic.*);
+        } else {
+            try testing.expectEqual(error.OutOfMemory, result);
+        }
+        if (result == error.OutOfMemory) {
+            if (mem.written().len != 0) {
+                try testing.expect(fixture.session.ended);
+                try testing.expectEqual(connection.State.err, driver.state);
+                try testing.expect(mem.closed);
+                try testing.expectError(error.LinkDetached, fixture.session.pump(10_000));
+            } else {
+                try testing.expect(!fixture.session.ended);
+                try testing.expectEqual(connection.State.opened, driver.state);
+            }
+            return error.OutOfMemory;
+        }
+        try testing.expectEqual(error.LinkDetached, result);
+        try testing.expect(!fixture.session.ended);
+        try testing.expectEqual(connection.State.opened, driver.state);
+        taken = fixture.session.takeFailedLinkOpen().?;
+        try testing.expect(fixture.session.failedLinkOpen() == null);
+
+        try peer.push(0, .{ .attach = .{
+            .name = "retry",
+            .handle = 41,
+            .role = if (kind == .sender) .receiver else .sender,
+            .initial_delivery_count = if (kind == .receiver) 0 else null,
+        } });
+        openDiagnosticTestLink(&fixture.session, kind, "retry") catch |err| {
+            try testing.expect(fixture.session.failedLinkOpen() == null);
+            return err;
+        };
+        try testing.expect(fixture.session.failedLinkOpen() == null);
+        try expectNestedDiagnostic(taken.?);
+    }
+    // The taken arena outlives the frame buffers, session, and driver.
+    try expectNestedDiagnostic(taken.?);
+}
+
+test "failed open nested diagnostics survive frame reuse and session destruction" {
+    inline for (std.meta.tags(RefusedLinkKind)) |kind| {
+        try refusedOpenUnderAllocator(testing.allocator, kind);
+    }
+}
+
+test "refused Attach Detach and cleanup survive every allocation failure" {
+    inline for (std.meta.tags(RefusedLinkKind)) |kind| {
+        var counting = testing.FailingAllocator.init(testing.allocator, .{});
+        try refusedOpenUnderAllocator(counting.allocator(), kind);
+        try testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
+        for (0..counting.alloc_index) |fail_index| {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            // Arena reset can fail an optional retention allocation and still
+            // decode. Success must satisfy all the same protocol and lifetime
+            // assertions; every injected failure must still free its bytes.
+            refusedOpenUnderAllocator(failing.allocator(), kind) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+            };
+            try testing.expect(failing.has_induced_failure);
+            try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
+}
+
+fn failDiagnosticDetachFlush(ptr: *anyopaque) @import("transport.zig").TransportError!void {
+    const mem: *MemoryTransport = @ptrCast(@alignCast(ptr));
+    if (mem.pending.items.len > frame.frame_header_size and
+        perf.peekDescriptor(mem.pending.items[frame.frame_header_size..]) == perf.descriptor.detach)
+        return error.WriteFailed;
+    return mem.transport().flush();
+}
+
+test "refused Attach response emission failures preserve diagnostics but forbid reuse" {
+    const Failure = enum { header, body, flush };
+    inline for (std.meta.tags(RefusedLinkKind)) |kind| {
+        inline for (std.meta.tags(Failure)) |failure| {
+            const allocator = testing.allocator;
+            var mem = MemoryTransport.init(allocator);
+            defer mem.deinit();
+            var clock: connection.ManualClock = .{};
+            const peer = Peer{ .allocator = allocator, .mem = &mem };
+            try scriptHandshake(peer, 65536);
+            var options = test_options;
+            options.max_frame_size = 65536;
+            var driver = try Driver.init(allocator, mem.transport(), clock.clock(), options);
+            defer driver.deinit();
+            var fixture = try Fixture.init(allocator, &mem, &clock, &driver);
+            defer fixture.deinit();
+
+            try pushDiagnosticRefusal(peer, kind, "old", .{ .condition = "amqp:old-error" });
+            try expectDiagnosticRefusal(&fixture.session, kind, "old");
+            try pushDiagnosticRefusal(peer, kind, "refused", diagnostic_test_error);
+            mem.clearWritten();
+            var vtable = mem.transport().vtable.*;
+            switch (failure) {
+                .header => mem.fail_write_after = mem.write_count + 2,
+                .body => mem.fail_write_after = mem.write_count + 3,
+                .flush => {
+                    vtable.flush = failDiagnosticDetachFlush;
+                    driver.transport = .{ .ptr = &mem, .vtable = &vtable };
+                },
+            }
+
+            try testing.expectError(error.WriteFailed, openDiagnosticTestLink(&fixture.session, kind, "refused"));
+            try testing.expect(fixture.session.ended);
+            try testing.expectEqual(connection.State.err, driver.state);
+            try testing.expect(mem.closed);
+            try testing.expectEqual(@as(usize, 0), fixture.session.senders.items.len);
+            try testing.expectEqual(@as(usize, 0), fixture.session.receivers.items.len);
+            try testing.expectEqual(@as(usize, 0), mem.pending.items.len);
+            try expectNestedDiagnostic(fixture.session.failedLinkOpen().?.*);
+
+            var frames = try EmittedFrames.parse(allocator, mem.written());
+            defer frames.deinit();
+            try testing.expectEqual(@as(usize, 1), frames.bodies.items.len);
+            try testing.expectEqual(perf.descriptor.attach, perf.peekDescriptor(frames.bodies.items[0]).?);
+            var taken = fixture.session.takeFailedLinkOpen().?;
+            defer taken.deinit();
+            const written = mem.written().len;
+            mem.fail_write_after = null;
+            driver.transport = mem.transport();
+            try testing.expectError(error.ConnectionClosed, openDiagnosticTestLink(&fixture.session, kind, "retry"));
+            try testing.expect(fixture.session.failedLinkOpen() == null);
+            try testing.expectEqual(written, mem.written().len);
+            try expectNestedDiagnostic(taken);
+        }
+    }
 }
 
 test "sender and receiver refused Attach wait for Detach and preserve diagnostics" {
