@@ -2,8 +2,8 @@
 
 Hand-written, idiomatic Zig conveniences for **Azure Storage Tables**.
 
-Release branch: `sdk/data_tables`. The latest published version is `0.2.0`;
-the next release introduces the breaking single-initializer API described below.
+Release branch: `sdk/data_tables`. Package version: `0.3.0`.
+Version 0.3.0 introduces the breaking single-initializer API described below.
 The `TableClient`, `TableServiceClient`, and `TableEntity` exports remain while the parity roadmap in
 [tracker #148](https://github.com/cataggar/azure-sdk-for-zig/issues/148) is
 implemented.

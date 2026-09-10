@@ -1879,7 +1879,7 @@ test "token client survives moves and applies all client options" {
         mock.last_headers.get("x-ms-client-request-id").?,
     );
     try std.testing.expectEqualStrings(
-        "my-app/1.0 azsdk-zig-data-tables/0.2.0",
+        "my-app/1.0 azsdk-zig-data-tables/0.3.0",
         mock.last_headers.get("User-Agent").?,
     );
     try std.testing.expectEqualStrings(
