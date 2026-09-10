@@ -54,11 +54,10 @@ test "Azurite table lifecycle, CRUD, query paging, ETag, and batch" {
     defer transport.deinit();
     var crypto = core.crypto.StdCryptoProvider.init(std.testing.io);
     const runtime = core.http.HttpRuntime.init(transport.asTransport(), crypto.asProvider());
-    var service = try tables.TableServiceClient.initFromConnectionString(
+    var service = try tables.TableServiceClient.init(
         allocator,
-        config.connection_string,
         runtime,
-        .{},
+        .{ .authentication = .{ .connection_string = config.connection_string } },
     );
     defer service.deinit();
 

@@ -19,12 +19,13 @@ pub fn main(init: std.process.Init) !void {
     if (endpoint) |service_endpoint| {
         if (env.get("AZURE_TOKEN")) |bearer| {
             var credential = core.env_token.EnvTokenCredential.init(allocator, bearer);
-            var client = try tables.TableServiceClient.initWithToken(
+            var client = try tables.TableServiceClient.init(
                 allocator,
-                service_endpoint,
-                credential.asCredential(),
                 runtime,
-                .{},
+                .{ .authentication = .{ .token = .{
+                    .endpoint = service_endpoint,
+                    .credential = credential.asCredential(),
+                } } },
             );
             defer client.deinit();
         }
@@ -37,43 +38,41 @@ pub fn main(init: std.process.Init) !void {
                 account_key,
             );
             defer credential.deinit();
-            var client = try tables.TableServiceClient.initWithSharedKey(
+            var client = try tables.TableServiceClient.init(
                 allocator,
-                service_endpoint,
-                &credential,
                 runtime,
-                .{},
+                .{ .authentication = .{ .shared_key = .{
+                    .endpoint = service_endpoint,
+                    .credential = &credential,
+                } } },
             );
             defer client.deinit();
         }
     }
 
     if (env.get("AZURE_DATA_TABLES_SAS_URL")) |sas_url| {
-        var client = try tables.TableServiceClient.initWithSasUrl(
+        var client = try tables.TableServiceClient.init(
             allocator,
-            sas_url,
             runtime,
-            .{},
+            .{ .authentication = .{ .sas_url = sas_url } },
         );
         defer client.deinit();
     }
 
     if (env.get("AZURE_DATA_TABLES_CONNECTION_STRING")) |connection_string| {
-        var client = try tables.TableServiceClient.initFromConnectionString(
+        var client = try tables.TableServiceClient.init(
             allocator,
-            connection_string,
             runtime,
-            .{},
+            .{ .authentication = .{ .connection_string = connection_string } },
         );
         defer client.deinit();
     }
 
     if (support.enabled(env, "AZURE_DATA_TABLES_AZURITE")) {
-        var client = try tables.TableServiceClient.initFromConnectionString(
+        var client = try tables.TableServiceClient.init(
             allocator,
-            "UseDevelopmentStorage=true",
             runtime,
-            .{},
+            .{ .authentication = .{ .connection_string = "UseDevelopmentStorage=true" } },
         );
         defer client.deinit();
     }

@@ -20,7 +20,7 @@ pub const transaction = @import("transaction.zig");
 pub const protocol = @import("azure_rest_data_tables");
 pub const ProtocolClient = protocol_client.ProtocolClient;
 
-// Compatibility exports for the original 0.1.0 package surface.
+// Public SDK convenience exports.
 pub const TableEntity = entity.TableEntity;
 pub const TableClient = client.TableClient;
 pub const TableServiceClient = service_client.TableServiceClient;
@@ -38,6 +38,9 @@ pub const SasIPRange = sas.IPRange;
 pub const SasUtcTime = sas.UtcTime;
 pub const SasQueryParameters = sas.QueryParameters;
 pub const ConnectionString = connection_string.Parsed;
+pub const ClientAuthentication = options.ClientAuthentication;
+pub const TableClientInitOptions = options.TableClientInitOptions;
+pub const TableServiceClientInitOptions = options.TableServiceClientInitOptions;
 pub const TableClientOptions = options.TableClientOptions;
 pub const TableServiceClientOptions = options.TableServiceClientOptions;
 pub const RetryOptions = options.RetryOptions;
@@ -108,6 +111,7 @@ pub const unwrapGetEntity = responses.unwrapGetEntity;
 pub const unwrapCreateEntity = responses.unwrapCreateEntity;
 
 test {
+    _ = @import("construction_test.zig");
     _ = auth;
     _ = client;
     _ = connection_string;
@@ -144,6 +148,9 @@ test {
     _ = SasUtcTime;
     _ = SasQueryParameters;
     _ = ConnectionString;
+    _ = ClientAuthentication;
+    _ = TableClientInitOptions;
+    _ = TableServiceClientInitOptions;
     _ = TableClientOptions;
     _ = TableServiceClientOptions;
     _ = RetryOptions;

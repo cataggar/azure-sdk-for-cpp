@@ -109,8 +109,10 @@ pub fn parse(allocator: std.mem.Allocator, value: []const u8) !Parsed {
         return error.InvalidConnectionString;
     if (account_name) |name| try auth.validateAccountName(name);
     if (account_key) |key| {
-        const decoded = @import("azure_sdk_core").base64.decode(allocator, key) catch
-            return error.InvalidAccountKey;
+        const decoded = core.base64.decode(allocator, key) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidAccountKey,
+        };
         defer wipeAndFree(allocator, decoded);
         if (decoded.len == 0) return error.InvalidAccountKey;
     }

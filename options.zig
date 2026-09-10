@@ -1,5 +1,6 @@
 const core = @import("azure_sdk_core");
 const protocol = @import("azure_rest_data_tables");
+const auth = @import("auth.zig");
 
 pub const latest_api_version = "2019-02-02";
 pub const MetadataFormat = protocol.enums.OdataMetadataFormat;
@@ -127,7 +128,41 @@ pub const TelemetryOptions = struct {
     application_id: ?[]const u8 = null,
 };
 
-/// Settings copied or applied by token-authenticated client constructors.
+/// Selects the endpoint and authentication together, without ambiguous mixes.
+///
+/// Input strings are borrowed only during client initialization. Explicit
+/// credentials remain borrowed for the lifetime of the client and its derived
+/// clients. Connection-string account keys become client-owned credentials.
+pub const ClientAuthentication = union(enum) {
+    token: struct {
+        endpoint: []const u8,
+        credential: *core.credentials.TokenCredential,
+    },
+    shared_key: struct {
+        endpoint: []const u8,
+        credential: *auth.SharedKeyCredential,
+    },
+    /// A complete signed URL. Its encoded query is preserved verbatim.
+    sas_url: []const u8,
+    connection_string: []const u8,
+
+    pub fn format(_: ClientAuthentication, writer: anytype) !void {
+        try writer.writeAll("TablesAuthentication(***)");
+    }
+};
+
+pub const TableClientInitOptions = struct {
+    authentication: ClientAuthentication,
+    table_name: []const u8,
+    options: TableClientOptions = .{},
+};
+
+pub const TableServiceClientInitOptions = struct {
+    authentication: ClientAuthentication,
+    options: TableServiceClientOptions = .{},
+};
+
+/// Settings copied or applied by client initialization.
 ///
 /// Policy objects and the transport are borrowed and must outlive the owning
 /// client. All string values and the policy pointer list are copied.

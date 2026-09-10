@@ -23,11 +23,10 @@ pub fn main(init: std.process.Init) !void {
     defer transport.deinit();
     var crypto = core.crypto.StdCryptoProvider.init(init.io);
     const runtime = core.http.HttpRuntime.init(transport.asTransport(), crypto.asProvider());
-    var service = try tables.TableServiceClient.initFromConnectionString(
+    var service = try tables.TableServiceClient.init(
         allocator,
-        connection_string,
         runtime,
-        .{},
+        .{ .authentication = .{ .connection_string = connection_string } },
     );
     defer service.deinit();
     var table = try service.getTableClient(table_name);
@@ -51,11 +50,10 @@ pub fn main(init: std.process.Init) !void {
     // connection string preserves the exact custom suffix/path and auth mode.
     if (env.get("AZURE_DATA_TABLES_SECONDARY_CONNECTION_STRING")) |secondary_connection_string| {
         if (secondary_connection_string.len != 0) {
-            var secondary = try tables.TableServiceClient.initFromConnectionString(
+            var secondary = try tables.TableServiceClient.init(
                 allocator,
-                secondary_connection_string,
                 runtime,
-                .{},
+                .{ .authentication = .{ .connection_string = secondary_connection_string } },
             );
             defer secondary.deinit();
             var statistics = try secondary.getStatistics(allocator, .{});
