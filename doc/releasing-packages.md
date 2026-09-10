@@ -36,6 +36,19 @@ scripts/package-branch-release.sh publish azure_sdk_storage_blobs --execute
 - the package-specific test, example, and live-test commands registered in
   `eng/packages.zig`.
 
+The `Package release verification` workflow runs the same read-only verification
+after validating the shared registry and history mappings:
+
+```bash
+gh workflow run package-release-verify.yml \
+  --repo cataggar/azure-sdk-for-zig \
+  --ref main \
+  -f package=azure_sdk_storage_blobs
+```
+
+It accepts any registered branch-owned package. It does not prepare a Main-owned
+release stage, publish tags, or advance package branches.
+
 `azure_sdk_core_symcrypt` uses source-only checks during sealed verification
 because release tooling has no ambient native SymCrypt binaries. Its package
 pull-request CI validates the native dynamic/static tests and examples on
