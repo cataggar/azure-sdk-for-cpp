@@ -142,6 +142,7 @@ source "$ROOT/scripts/lib/package-bootstrap.sh"
 case "$2" in
   canonical) canonical_repository "$3" ;;
   url) bootstrap_url "$3" github.com/cataggar/azure-sdk-for-zig ;;
+  fixture-url) bootstrap_url "$3" "$4" ;;
 esac
 EOF
 for url in https://github.com/cataggar/azure-sdk-for-zig.git \
@@ -160,6 +161,39 @@ for url in http://github.com/cataggar/azure-sdk-for-zig.git \
   expect_failure "ambiguous/noncanonical URL" 'canonical HTTPS/SSH' \
     bash "$WORK/identity.sh" "$TOOLING" url "$url"
 done
+
+# Use the real MSYS converter on Windows and a bounded fixture double elsewhere.
+PATH_CONVERTER_PATH="$PATH"
+if command -v cygpath >/dev/null 2>&1; then
+  NATIVE_REMOTE="$(cygpath -m "$REMOTE")"
+  NATIVE_REMOTE_BACKSLASH="$(cygpath -w "$REMOTE")"
+  NATIVE_OTHER="$(cygpath -m "$OTHER")"
+else
+  mkdir "$WORK/path-bin"
+  cat >"$WORK/path-bin/cygpath" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "\$#" == 2 && "\$1" == -u ]] || exit 1
+case "\$2" in
+  'D:/bootstrap/remote.git'|'D:\bootstrap\remote.git') printf '%s\n' '$REMOTE' ;;
+  'D:/bootstrap/other.git') printf '%s\n' '$OTHER' ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$WORK/path-bin/cygpath"
+  PATH_CONVERTER_PATH="$WORK/path-bin:$PATH"
+  NATIVE_REMOTE='D:/bootstrap/remote.git'
+  NATIVE_REMOTE_BACKSLASH='D:\bootstrap\remote.git'
+  NATIVE_OTHER='D:/bootstrap/other.git'
+fi
+for url in "$REMOTE" "$NATIVE_REMOTE" "$NATIVE_REMOTE_BACKSLASH"; do
+  env PATH="$PATH_CONVERTER_PATH" bash "$WORK/identity.sh" "$TOOLING" fixture-url "$url" "$TRUSTED"
+done
+printf 'PASS: POSIX and native Windows fixture paths have the same trusted identity\n'
+expect_failure "native Windows fixture cannot change repository" 'unexpected repository' \
+  env PATH="$PATH_CONVERTER_PATH" bash "$WORK/identity.sh" "$TOOLING" fixture-url "$NATIVE_OTHER" "$TRUSTED"
+expect_failure "production still rejects native Windows fixture paths" 'canonical HTTPS/SSH' \
+  env PATH="$PATH_CONVERTER_PATH" bash "$WORK/identity.sh" "$TOOLING" url "$NATIVE_REMOTE"
 
 git -C "$SOURCE" tag -a -f "$TAG" -m annotated >/dev/null
 git --git-dir="$REMOTE" fetch --quiet "$SOURCE" "+refs/tags/$TAG:refs/tags/$TAG"

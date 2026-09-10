@@ -36,6 +36,12 @@ bootstrap_url() {
     esac
   else
     # Only the offline test runner supplies a local trust context.
+    if [[ "$url" =~ ^[A-Za-z]:[/\\] ]]; then
+      # Native Windows Git returns drive paths; compare in Bash's path namespace.
+      command -v cygpath >/dev/null 2>&1 ||
+        bootstrap_fail "native fixture paths require the MSYS path converter"
+      url="$(cygpath -u "$url")"
+    fi
     [[ "$url" == /* && -d "$url" && ! -L "$url" &&
       "$url" == "$(cd "$url" && pwd -P)" ]] ||
       bootstrap_fail "fixture remote must be an exact resolved directory"
