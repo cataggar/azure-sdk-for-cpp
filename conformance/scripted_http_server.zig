@@ -286,8 +286,10 @@ pub const ScriptedHttpServer = struct {
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (line.len == 0) break;
             const owned_line = try self.allocator.dupe(u8, line);
-            errdefer self.allocator.free(owned_line);
-            try self.header_lines.append(self.allocator, owned_line);
+            self.header_lines.append(self.allocator, owned_line) catch |err| {
+                self.allocator.free(owned_line);
+                return err;
+            };
             const header = splitHeader(line) orelse continue;
             if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
                 content_length = try std.fmt.parseInt(usize, header.value, 10);
@@ -439,6 +441,32 @@ pub const ScriptedHttpServer = struct {
 fn elapsedNanoseconds(io: std.Io, start: std.Io.Timestamp) i128 {
     return std.Io.Timestamp.now(io, .awake).toNanoseconds() -
         start.toNanoseconds();
+}
+
+test "malformed and overflowing Content-Length retain exclusive header ownership through cleanup" {
+    const cases = .{
+        .{ "not-a-number", error.InvalidCharacter },
+        .{ "184467440737095516160", error.Overflow },
+    };
+    inline for (cases) |case| {
+        const io = std.testing.io;
+        var server = try ScriptedHttpServer.init(std.testing.allocator, io, .{});
+        defer server.deinit();
+        try server.start();
+        const client = try server.listener.socket.address.connect(io, .{ .mode = .stream });
+        defer client.close(io);
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.net.Stream.Writer.init(client, io, &buffer);
+        try writer.interface.print(
+            "POST /malformed HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {s}\r\n\r\n",
+            .{case[0]},
+        );
+        try writer.interface.flush();
+
+        try std.testing.expectError(case[1], server.join());
+        try std.testing.expectEqual(@as(usize, 2), server.header_lines.items.len);
+        try std.testing.expectEqualStrings(case[0], server.headerValue("content-length").?);
+    }
 }
 
 test "scripted server teardown completes without a client" {

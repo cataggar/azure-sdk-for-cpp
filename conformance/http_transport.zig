@@ -248,22 +248,40 @@ pub fn runBackendAllocationFailureContracts(
     if (!factory.capabilities.allocation_failure_cleanup) return;
     if (factory.allocationFixtureFn == null) return error.AllocationFixtureRequired;
     inline for (std.meta.tags(AllocationScenario)) |scenario| {
-        try std.testing.checkAllAllocationFailures(
-            allocator,
-            backendAllocationFixture,
-            .{ allocator, io, factory, scenario },
-        );
+        var baseline = std.testing.FailingAllocator.init(allocator, .{});
+        try backendAllocationFixture(&baseline, allocator, io, factory, scenario);
+        for (0..baseline.alloc_index) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+            if (backendAllocationFixture(&failing, allocator, io, factory, scenario)) |_| {
+                return if (failing.has_induced_failure)
+                    error.SwallowedOutOfMemoryError
+                else
+                    error.NondeterministicMemoryUsage;
+            } else |err| switch (err) {
+                error.OutOfMemory => {
+                    if (!failing.has_induced_failure) return error.UninjectedOutOfMemory;
+                },
+                else => return err,
+            }
+        }
     }
 }
 
 fn backendAllocationFixture(
-    allocator: std.mem.Allocator,
+    failing: *std.testing.FailingAllocator,
     fixture_allocator: std.mem.Allocator,
     io: std.Io,
     factory: BackendFactory,
     scenario: AllocationScenario,
 ) !void {
-    try factory.allocationFixtureFn.?(factory.context, allocator, fixture_allocator, io, scenario);
+    const result = factory.allocationFixtureFn.?(factory.context, failing.allocator(), fixture_allocator, io, scenario);
+    if (failing.allocated_bytes != failing.freed_bytes) return error.MemoryLeakDetected;
+    result catch |err| {
+        // std.Io.Writer hides allocation errors behind WriteFailed. Only the
+        // runner-owned allocator can prove this iteration injected a failure.
+        if (err == error.WriteFailed and failing.has_induced_failure) return error.OutOfMemory;
+        return err;
+    };
 }
 
 /// Adapter fixtures must synchronize entry into the blocked phase, then signal
@@ -1382,12 +1400,7 @@ fn standardAllocationFixture(
     io: std.Io,
     scenario: AllocationScenario,
 ) !void {
-    runBackendAllocationScenario(allocator, fixture_allocator, io, standardBackendFactory(), scenario) catch |err| switch (err) {
-        // std.Io.Writer exposes allocation failures as WriteFailed. The
-        // unfaulted baseline must succeed, so real network errors still fail.
-        error.WriteFailed => return error.OutOfMemory,
-        else => return err,
-    };
+    try runBackendAllocationScenario(allocator, fixture_allocator, io, standardBackendFactory(), scenario);
 }
 
 const StdBackendState = struct {
@@ -1674,6 +1687,60 @@ test "standard backend allocation failures clean up actual operations and connec
         std.testing.io,
         standardBackendFactory(),
     );
+}
+
+test "backend allocation runner rejects uninjected writer and normalized OOM errors" {
+    const Fixture = struct {
+        calls: usize = 0,
+        outcome: anyerror,
+
+        fn run(
+            context: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: AllocationScenario,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            const first = try allocator.create(u8);
+            defer allocator.destroy(first);
+            // The baseline allocates twice. On fail_index=1, an unrelated
+            // error occurs before the second allocation can actually fail.
+            if (self.calls == 3) return self.outcome;
+            const second = try allocator.create(u8);
+            defer allocator.destroy(second);
+        }
+    };
+    inline for (.{ error.WriteFailed, error.OutOfMemory }) |outcome| {
+        var fixture = Fixture{ .outcome = outcome };
+        var factory = standardBackendFactory();
+        factory.context = &fixture;
+        factory.allocationFixtureFn = &Fixture.run;
+        try std.testing.expectError(
+            if (outcome == error.OutOfMemory) error.UninjectedOutOfMemory else error.WriteFailed,
+            runBackendAllocationFailureContracts(std.testing.allocator, std.testing.io, factory),
+        );
+        try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    }
+}
+
+test "backend allocation runner accepts writer errors only after induced allocation failure" {
+    const Fixture = struct {
+        fn run(
+            _: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: AllocationScenario,
+        ) !void {
+            const value = allocator.create(u8) catch return error.WriteFailed;
+            allocator.destroy(value);
+        }
+    };
+    var factory = standardBackendFactory();
+    factory.allocationFixtureFn = &Fixture.run;
+    try runBackendAllocationFailureContracts(std.testing.allocator, std.testing.io, factory);
 }
 
 test "claimed adapter capabilities require integration evidence hooks" {

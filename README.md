@@ -145,7 +145,10 @@ Adapters opt in only when their fixture implements the associated contract:
   fails allocations in buffered, finish, abort, redirect, and retry scenarios.
   `runBackendAllocationScenario` is a reusable implementation for that hook;
   adapters must additionally account for native handles/pools and normalize
-  allocator-caused wrapper errors to `OutOfMemory`. The peer uses the separate
+  allocator-caused wrapper errors to `OutOfMemory`. The runner owns each
+  failing allocator and rejects OOM results without an induced failure;
+  `WriteFailed` is normalized only after an induced allocation failure.
+  The peer uses the separate
   fixture allocator, never the failing allocator on a second thread. Without
   HTTPS fixtures, the redirect scenario proves rejection-path cleanup only.
   The original zero-argument `runAllocationFailureContracts()` still tests
