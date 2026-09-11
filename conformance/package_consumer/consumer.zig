@@ -9,6 +9,16 @@ test "manifest-filtered package exports usable conformance modules" {
         std.testing.io,
         http.mockBackendFactory(),
     );
+    try http.runPipelineContracts(
+        std.testing.allocator,
+        std.testing.io,
+        http.standardBackendFactory(),
+    );
+    try http.runBackendAllocationFailureContracts(
+        std.testing.allocator,
+        std.testing.io,
+        http.standardBackendFactory(),
+    );
     try crypto.runCryptoContracts(
         std.testing.allocator,
         std.testing.io,

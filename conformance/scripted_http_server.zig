@@ -13,6 +13,30 @@ pub const Response = struct {
     chunked: bool = false,
     advertised_content_length: ?usize = null,
     omit_body: bool = false,
+    generated_body: ?GeneratedBody = null,
+};
+
+pub const GeneratedBody = struct {
+    byte: u8,
+    length: usize,
+    chunk_size: usize = 4093,
+};
+
+pub const CapturedRequest = struct {
+    request_line: []u8,
+    header_lines: std.ArrayList([]u8),
+    body_prefix: [4096]u8,
+    body_prefix_len: usize,
+    body_length: usize,
+    body_hash: u64,
+
+    pub fn headerValue(self: *const CapturedRequest, name: []const u8) ?[]const u8 {
+        for (self.header_lines.items) |line| {
+            const header = ScriptedHttpServer.splitHeader(line) orelse continue;
+            if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+        }
+        return null;
+    }
 };
 
 const StopInterleaveHooks = struct {
@@ -22,7 +46,8 @@ const StopInterleaveHooks = struct {
     cleanup_entered: *std.Io.Event,
 };
 
-/// A one-request loopback HTTP/1.1 server for deterministic transport tests.
+/// A loopback HTTP/1.1 server for deterministic transport tests. By default it
+/// serves one request; a nonempty responses script runs until stopAndJoin.
 ///
 /// Request bodies are counted while only a bounded prefix is retained, so
 /// conformance tests can exercise logical-large streams without allocating
@@ -46,6 +71,11 @@ pub const ScriptedHttpServer = struct {
     body_prefix: [4096]u8 = undefined,
     body_prefix_len: usize = 0,
     body_length: usize = 0,
+    body_hasher: std.hash.Wyhash = std.hash.Wyhash.init(0),
+    /// Nonempty scripts serve successive connections until stopAndJoin.
+    /// Exhausted scripts return 418 rather than hanging an unexpected retry.
+    responses: []const Response = &.{},
+    requests: std.ArrayList(CapturedRequest) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -101,9 +131,15 @@ pub const ScriptedHttpServer = struct {
         if (self.request_line.len > 0) self.allocator.free(self.request_line);
         for (self.header_lines.items) |line| self.allocator.free(line);
         self.header_lines.deinit(self.allocator);
+        for (self.requests.items) |*request| {
+            self.allocator.free(request.request_line);
+            for (request.header_lines.items) |line| self.allocator.free(line);
+            request.header_lines.deinit(self.allocator);
+        }
+        self.requests.deinit(self.allocator);
     }
 
-    fn stopAndJoin(self: *ScriptedHttpServer) !void {
+    pub fn stopAndJoin(self: *ScriptedHttpServer) !void {
         if (self.joined or self.thread == null) return;
         self.requestStop();
         try self.waitForDone();
@@ -193,9 +229,19 @@ pub const ScriptedHttpServer = struct {
 
     fn run(self: *ScriptedHttpServer) void {
         defer self.done.set(self.io);
-        self.serve() catch |err| {
-            if (!self.isStopping()) self.failure = err;
-        };
+        while (!self.isStopping()) {
+            if (self.responses.len > 0) {
+                self.response = if (self.requests.items.len < self.responses.len)
+                    self.responses[self.requests.items.len]
+                else
+                    .{ .status_code = 418, .reason = "Unexpected attempt" };
+            }
+            self.serve() catch |err| {
+                if (!self.isStopping()) self.failure = err;
+                return;
+            };
+            if (self.responses.len == 0 or self.isStopping()) return;
+        }
     }
 
     fn serve(self: *ScriptedHttpServer) !void {
@@ -239,10 +285,11 @@ pub const ScriptedHttpServer = struct {
                 return error.ServerHeaderReadFailed;
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (line.len == 0) break;
-            try self.header_lines.append(
-                self.allocator,
-                try self.allocator.dupe(u8, line),
-            );
+            const owned_line = try self.allocator.dupe(u8, line);
+            self.header_lines.append(self.allocator, owned_line) catch |err| {
+                self.allocator.free(owned_line);
+                return err;
+            };
             const header = splitHeader(line) orelse continue;
             if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
                 content_length = try std.fmt.parseInt(usize, header.value, 10);
@@ -255,6 +302,22 @@ pub const ScriptedHttpServer = struct {
             try self.readChunkedBody(&reader.interface);
         } else if (content_length) |length| {
             try self.readBody(&reader.interface, length);
+        }
+
+        if (self.responses.len > 0) {
+            try self.requests.append(self.allocator, .{
+                .request_line = self.request_line,
+                .header_lines = self.header_lines,
+                .body_prefix = self.body_prefix,
+                .body_prefix_len = self.body_prefix_len,
+                .body_length = self.body_length,
+                .body_hash = self.body_hasher.final(),
+            });
+            self.request_line = &.{};
+            self.header_lines = .empty;
+            self.body_prefix_len = 0;
+            self.body_length = 0;
+            self.body_hasher = std.hash.Wyhash.init(0);
         }
 
         try writer.interface.print(
@@ -271,7 +334,9 @@ pub const ScriptedHttpServer = struct {
             try writer.interface.writeAll(
                 "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
             );
-            if (!self.response.omit_body and self.response.body.len > 0) {
+            if (!self.response.omit_body and self.response.generated_body != null) {
+                try writeGenerated(&writer.interface, self.response.generated_body.?, true);
+            } else if (!self.response.omit_body and self.response.body.len > 0) {
                 const midpoint = (self.response.body.len + 1) / 2;
                 try writer.interface.print("{x}\r\n", .{midpoint});
                 try writer.interface.writeAll(self.response.body[0..midpoint]);
@@ -287,16 +352,34 @@ pub const ScriptedHttpServer = struct {
             try writer.interface.writeAll("0\r\n\r\n");
         } else {
             const content_length_value = self.response.advertised_content_length orelse
-                self.response.body.len;
+                if (self.response.generated_body) |generated| generated.length else self.response.body.len;
             try writer.interface.print(
                 "Content-Length: {d}\r\nConnection: close\r\n\r\n",
                 .{content_length_value},
             );
             if (!self.response.omit_body) {
-                try writer.interface.writeAll(self.response.body);
+                if (self.response.generated_body) |generated| {
+                    try writeGenerated(&writer.interface, generated, false);
+                } else {
+                    try writer.interface.writeAll(self.response.body);
+                }
             }
         }
         try writer.interface.flush();
+    }
+
+    fn writeGenerated(writer: *std.Io.Writer, generated: GeneratedBody, chunked: bool) !void {
+        if (generated.chunk_size == 0) return error.InvalidGeneratedChunkSize;
+        var buffer: [16 * 1024]u8 = undefined;
+        @memset(&buffer, generated.byte);
+        var remaining = generated.length;
+        while (remaining > 0) {
+            const count = @min(remaining, buffer.len, generated.chunk_size);
+            if (chunked) try writer.print("{x}\r\n", .{count});
+            try writer.writeAll(buffer[0..count]);
+            if (chunked) try writer.writeAll("\r\n");
+            remaining -= count;
+        }
     }
 
     fn readChunkedBody(
@@ -349,6 +432,7 @@ pub const ScriptedHttpServer = struct {
                 self.body_prefix_len += copy_len;
             }
             self.body_length += amount;
+            self.body_hasher.update(buffer[0..amount]);
             remaining -= amount;
         }
     }
@@ -357,6 +441,32 @@ pub const ScriptedHttpServer = struct {
 fn elapsedNanoseconds(io: std.Io, start: std.Io.Timestamp) i128 {
     return std.Io.Timestamp.now(io, .awake).toNanoseconds() -
         start.toNanoseconds();
+}
+
+test "malformed and overflowing Content-Length retain exclusive header ownership through cleanup" {
+    const cases = .{
+        .{ "not-a-number", error.InvalidCharacter },
+        .{ "184467440737095516160", error.Overflow },
+    };
+    inline for (cases) |case| {
+        const io = std.testing.io;
+        var server = try ScriptedHttpServer.init(std.testing.allocator, io, .{});
+        defer server.deinit();
+        try server.start();
+        const client = try server.listener.socket.address.connect(io, .{ .mode = .stream });
+        defer client.close(io);
+        var buffer: [1024]u8 = undefined;
+        var writer = std.Io.net.Stream.Writer.init(client, io, &buffer);
+        try writer.interface.print(
+            "POST /malformed HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {s}\r\n\r\n",
+            .{case[0]},
+        );
+        try writer.interface.flush();
+
+        try std.testing.expectError(case[1], server.join());
+        try std.testing.expectEqual(@as(usize, 2), server.header_lines.items.len);
+        try std.testing.expectEqualStrings(case[0], server.headerValue("content-length").?);
+    }
 }
 
 test "scripted server teardown completes without a client" {

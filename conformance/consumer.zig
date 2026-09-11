@@ -8,6 +8,10 @@ comptime {
     _ = http_conformance.runRawTransportContracts;
     _ = http_conformance.runPipelineContracts;
     _ = http_conformance.runAllocationFailureContracts;
+    _ = http_conformance.runBackendAllocationFailureContracts;
+    _ = http_conformance.runBackendAllocationScenario;
+    _ = http_conformance.InterruptionCapabilities;
+    _ = http_conformance.runInterruptionContracts;
     _ = crypto_conformance.ProviderFactory;
     _ = crypto_conformance.runCryptoContracts;
     _ = crypto_conformance.runProviderBoundaryContracts;
