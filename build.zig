@@ -10,6 +10,17 @@ pub fn build(b: *std.Build) void {
         package_test_tail,
     );
     test_step.dependOn(&direct_consumer.step);
+    const runtime_consumer = addFixtureTest(
+        b,
+        "eng/fixtures/current_runtime_consumer",
+        &direct_consumer.step,
+    );
+    test_step.dependOn(&runtime_consumer.step);
+    const runtime_consumer_step = b.step(
+        "current-runtime-consumer-test",
+        "Test the immutable current-runtime package consumer",
+    );
+    runtime_consumer_step.dependOn(&runtime_consumer.step);
 
     addPackageToolSteps(b, test_step);
     addCodegenSteps(b);
