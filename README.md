@@ -16,6 +16,7 @@ provider/streaming release line is `0.3.0`.
 | `http.SequenceMockTransport` | Ordered responses for retry tests |
 | `http.HttpRuntime` | Selected HTTP transport and SDK crypto provider |
 | `http.HttpPipeline` | Policies followed by one runtime |
+| `http.RequestHeaders` | Owned case-insensitive request headers with allocation-free trace restoration |
 | `http.TelemetryPolicy` | Adds `User-Agent` |
 | `http.LoggingPolicy` | Logs requests through `std.log` |
 | `http.RetryPolicy` | Bounded exponential backoff, jitter, and `Retry-After` |
@@ -29,7 +30,7 @@ provider/streaming release line is `0.3.0`.
 | `errors` | Azure error-envelope parsing |
 | `lro` | Long-running-operation polling |
 | `pager` | Generic `PipelinePager` |
-| `tracing` | Span and attribute plumbing |
+| `tracing` | Opt-in bounded spans and explicit OTLP JSON output |
 | `perf` | Wall-clock and allocation benchmark harness |
 
 `HttpTransport.open` and `HttpPipeline.open` return a heap-backed,
@@ -57,6 +58,13 @@ for every pipeline, credential call, client, and open operation that uses
 them. `StdHttpTransport` remains caller-serialized. Custom crypto provider
 contexts must be concurrent-safe or caller-serialized. Incremental SHA-256
 operations own stable allocator-backed state and must be deinitialized once.
+
+`Request.headers` is now an owned `http.RequestHeaders`, not a raw
+`std.StringHashMap`. Existing `Request.setHeader` / `getHeader` calls are
+unchanged. Direct map mutation and typed map pointers require the
+[request-header migration](http/request_headers.md). Response-header APIs are
+unchanged. This is a public source-compatibility change to account for when
+releasing Core and repinning consumers.
 
 ## Adapter conformance
 

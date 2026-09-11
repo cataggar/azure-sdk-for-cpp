@@ -8,6 +8,7 @@ const decompression = @import("http/decompression.zig");
 pub const Method = transport.Method;
 pub const RedirectPolicy = transport.RedirectPolicy;
 pub const Request = transport.Request;
+pub const RequestHeaders = transport.RequestHeaders;
 pub const ResponseHeader = transport.ResponseHeader;
 pub const ResponseHeaders = transport.ResponseHeaders;
 pub const Response = transport.Response;

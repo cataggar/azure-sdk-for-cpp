@@ -22,7 +22,7 @@ pub const HostRequest = struct {
     scheme: Scheme,
     authority: []const u8,
     path_with_query: []const u8,
-    headers: *const std.StringHashMap([]const u8),
+    headers: *const transport.RequestHeaders,
 };
 
 pub const HostResponse = struct {
@@ -142,6 +142,7 @@ const RecordingHost = struct {
     path: [512]u8 = undefined,
     path_len: usize = 0,
     saw_host: bool = false,
+    trace_headers_seen: usize = 0,
 
     fn authorityValue(self: *const RecordingHost) []const u8 {
         return self.authority[0..self.authority_len];
@@ -173,6 +174,13 @@ const RecordingHost = struct {
             if (std.ascii.eqlIgnoreCase(header.key_ptr.*, "host")) {
                 self.saw_host = true;
             }
+            if (std.ascii.eqlIgnoreCase(header.key_ptr.*, "traceparent") or
+                std.ascii.eqlIgnoreCase(header.key_ptr.*, "tracestate"))
+            {
+                if (!std.mem.eql(u8, request.headers.get(header.key_ptr.*).?, header.value_ptr.*))
+                    return error.FakeHostHeaderMismatch;
+                self.trace_headers_seen += 1;
+            }
         }
         return .{
             .status_code = 202,
@@ -198,6 +206,8 @@ test "native fake host exercises target-neutral WASI adaptation" {
     );
     defer request.deinit();
     try request.setHeader("Host", "ignored.example");
+    try request.setHeader("TraceParent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+    try request.setHeader("TraceState", "");
     var response = try adapter.asTransport().send(&request);
     defer response.deinit();
 
@@ -207,6 +217,7 @@ test "native fake host exercises target-neutral WASI adaptation" {
     try std.testing.expectEqualStrings("example.com:8443", fake.authorityValue());
     try std.testing.expectEqualStrings("/path?query=yes", fake.pathValue());
     try std.testing.expect(fake.saw_host);
+    try std.testing.expectEqual(@as(usize, 2), fake.trace_headers_seen);
     try std.testing.expectEqualStrings("fake-host", response.body);
     const values = try response.getHeaderValues(std.testing.allocator, "x-test");
     defer std.testing.allocator.free(values);

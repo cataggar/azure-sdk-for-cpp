@@ -76,24 +76,17 @@ pub fn safeAttributes(span: *tracing.Span, request: *const Request, namespace: [
     if (uri.port) |port| span.setTypedAttribute("server.port", .{ .int = port }) catch {};
 }
 
-const Header = struct { key: []const u8, value: []const u8 };
-
 /// Moves caller-owned entries aside, installs request-owned copies, then restores
-/// the originals. No saved slice points at a stack traceparent buffer.
-/// Policies must retain restoration slots: replacing values and mutating unrelated
-/// headers is safe; deleting managed entries and filling their slots is not.
+/// them into dedicated storage, independently of all policy map mutations.
 const HeaderGuard = struct {
     request: *Request,
-    parent: ?Header,
-    state: ?Header,
+    saved: @import("../http/request_headers.zig").RequestHeaders.TraceHeaders,
     previous_managed: bool,
 
     fn install(request: *Request, context: tracing.TraceContext) !HeaderGuard {
-        try request.headers.ensureUnusedCapacity(2);
         var self: HeaderGuard = .{
             .request = request,
-            .parent = take(request, "traceparent"),
-            .state = take(request, "tracestate"),
+            .saved = request.headers.takeTraceHeaders(),
             .previous_managed = request.tracing_headers_managed,
         };
         errdefer self.restore();
@@ -105,46 +98,13 @@ const HeaderGuard = struct {
             null;
         if (state) |value| {
             try request.setHeader("tracestate", value);
-        } else if (self.state != null) {
-            // W3C permits an empty tracestate. Discard invalid contents while
-            // retaining the map slot needed to restore the caller's entry.
-            try request.setHeader("tracestate", "");
         }
         request.tracing_headers_managed = true;
         return self;
     }
 
-    fn take(request: *Request, name: []const u8) ?Header {
-        var it = request.headers.iterator();
-        while (it.next()) |entry| {
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
-                const removed = request.headers.fetchRemove(entry.key_ptr.*).?;
-                return .{ .key = removed.key, .value = removed.value };
-            }
-        }
-        return null;
-    }
-
-    fn free(request: *Request, header: ?Header) void {
-        if (header) |h| {
-            request.allocator.free(h.key);
-            request.allocator.free(h.value);
-        }
-    }
-
     fn restore(self: *HeaderGuard) void {
-        free(self.request, take(self.request, "traceparent"));
-        free(self.request, take(self.request, "tracestate"));
+        self.request.headers.restoreTraceHeaders(&self.saved);
         self.request.tracing_headers_managed = self.previous_managed;
-        const saved_count: u32 = @as(u32, @intFromBool(self.parent != null)) +
-            @intFromBool(self.state != null);
-        // Removing our entries supplies the actual 0/1/2 restoration slots.
-        // Allocating here could turn a successful request into lost caller state.
-        if (self.request.headers.unmanaged.available < saved_count)
-            @panic("HTTP policy consumed caller trace-header restoration slots");
-        if (self.parent) |h| self.request.headers.putAssumeCapacity(h.key, h.value);
-        if (self.state) |h| self.request.headers.putAssumeCapacity(h.key, h.value);
-        self.parent = null;
-        self.state = null;
     }
 };

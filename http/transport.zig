@@ -1,5 +1,6 @@
 const std = @import("std");
 const url_mod = @import("../url.zig");
+pub const RequestHeaders = @import("request_headers.zig").RequestHeaders;
 
 /// HTTP method verbs.
 pub const Method = enum {
@@ -35,7 +36,7 @@ pub const RedirectPolicy = enum {
 pub const Request = struct {
     method: Method = .GET,
     url: []const u8,
-    headers: std.StringHashMap([]const u8),
+    headers: RequestHeaders,
     body: ?[]const u8 = null,
     allocator: std.mem.Allocator,
     retryable: bool = true,
@@ -50,69 +51,34 @@ pub const Request = struct {
     /// Per-call trace parent/suppression. HTTP cancellation still uses OpenOptions.
     context: @import("../context.zig").Context = .none,
     /// Managed by tracing during dispatch; controls cross-origin header stripping.
-    /// Policies replacing values or mutating unrelated headers are safe. Removing
-    /// managed entries/replacing the map requires retaining two restoration slots;
-    /// see tracing/README.md. Use context.tracing_suppressed before dispatch to opt out.
     tracing_headers_managed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, method: Method, request_url: []const u8) Request {
         return .{
             .method = method,
             .url = request_url,
-            .headers = std.StringHashMap([]const u8).init(allocator),
+            .headers = RequestHeaders.init(allocator),
             .body = null,
             .allocator = allocator,
         };
     }
 
     pub fn setHeader(self: *Request, key: []const u8, value: []const u8) !void {
-        if (key.len == 0) return error.InvalidHttpHeaderName;
-        for (key) |byte| {
-            if (!isHttpTokenByte(byte)) return error.InvalidHttpHeaderName;
-        }
-        for (value) |byte| {
-            if ((byte < 0x20 and byte != '\t') or byte == 0x7f)
-                return error.InvalidHttpHeaderValue;
-        }
-
-        const owned_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(owned_value);
-
-        var iterator = self.headers.iterator();
-        while (iterator.next()) |entry| {
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, key)) {
-                self.allocator.free(entry.value_ptr.*);
-                entry.value_ptr.* = owned_value;
-                return;
-            }
-        }
-
-        const owned_key = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned_key);
-        try self.headers.put(owned_key, owned_value);
+        try self.headers.put(key, value);
     }
 
     pub fn getHeader(self: *const Request, key: []const u8) ?[]const u8 {
-        var iterator = self.headers.iterator();
-        while (iterator.next()) |entry| {
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, key)) {
-                return entry.value_ptr.*;
-            }
-        }
-        return null;
+        return self.headers.get(key);
+    }
+
+    pub fn removeHeader(self: *Request, key: []const u8) bool {
+        return self.headers.remove(key);
     }
 
     pub fn deinit(self: *Request) void {
-        deinitOwnedHeaders(self.allocator, &self.headers);
+        self.headers.deinit();
     }
 };
-
-fn isHttpTokenByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or switch (byte) {
-        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-        else => false,
-    };
-}
 
 pub const ResponseHeader = struct {
     name: []const u8,
@@ -2767,6 +2733,10 @@ test "standard transport sends well-known headers exactly once" {
     try request.setHeader("User-Agent", "azsdk-zig-test/1.0");
     try request.setHeader("Accept-Encoding", "gzip");
     try request.setHeader("Accept", "application/json");
+    const parent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    try request.setHeader("TraceParent", parent);
+    try request.setHeader("traceparent", parent);
+    try request.setHeader("TraceState", "vendor=value, ,other=value");
 
     var operation = transport.asTransport().open(&request, .{}) catch |err| {
         thread.join();
@@ -2783,6 +2753,10 @@ test "standard transport sends well-known headers exactly once" {
     try std.testing.expectEqual(@as(usize, 1), context.count("host"));
     try std.testing.expectEqual(@as(usize, 1), context.count("connection"));
     try std.testing.expectEqual(@as(usize, 1), context.count("accept"));
+    try std.testing.expectEqual(@as(usize, 1), context.count("traceparent"));
+    try std.testing.expectEqual(@as(usize, 1), context.count("tracestate"));
+    try std.testing.expectEqualStrings(parent, context.value("traceparent").?);
+    try std.testing.expectEqualStrings("vendor=value, ,other=value", context.value("tracestate").?);
     // The caller's value must win over the built-in default.
     try std.testing.expectEqualStrings(
         "azsdk-zig-test/1.0",

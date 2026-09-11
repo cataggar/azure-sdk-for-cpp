@@ -77,24 +77,17 @@ valid child IDs without queuing records.
 Generated headers are request-owned, restored on completion, and are not
 re-extracted as parents on retries or request reuse. Installation-allocation
 failures leave the caller's original entries intact and increment the provider's
-`propagation_errors` counter without replacing service results. Restoration
-itself does not allocate: removing the installed entries frees the actual 0/1/2
-slots needed by saved caller entries. If an original tracestate had invalid
-contents, dispatch uses a valid empty tracestate field, discarding the invalid
-contents while retaining its restoration slot. The exact original value,
-including invalid or empty values, is restored afterward.
+`propagation_errors` counter without replacing service results.
 
-**Policy mutation contract:** policies may add, replace, and remove unrelated
-headers and replace managed trace-header values. If they remove managed trace
-entries or replace the header map, they must leave enough unused slots for all
-saved caller entries (reserving two is sufficient). They must not consume those
-restoration slots with unrelated additions. Keeping the managed entries is the
-simple allocation-free option; suppress tracing before dispatch when propagation
-is unwanted. Direct map mutation that destroys those slots is diagnosed as a
-programming-contract violation, not a successful restore or discarded caller
-context. Arbitrary removal plus saturation cannot preserve all unrelated
-mutations and originals under permanent allocation failure in a single hash map;
-supporting it would require a different header API/storage contract.
+`Request.headers` is now an owned `core.http.RequestHeaders`; see the
+[public-header API migration](../http/request_headers.md). Its two fixed owned
+trace slots are independent of the ordinary hash table. Restoration moves the
+saved entries back without allocating, discarding originals, or panicking, even
+when policies remove/replace managed entries, fill/grow/clear the ordinary table,
+or replace the collection with one using another allocator. Unrelated policy
+mutations and the original service result/error are preserved. There is no
+spare-slot-retention contract. Invalid incoming tracestate is omitted during
+dispatch; its exact original value, like valid/empty state, is restored afterward.
 
 The shared transport strips managed trace headers
 on cross-origin redirects; same-origin hops retain them. Uninstrumented,

@@ -266,38 +266,31 @@ test "tracing restoration at the map load limit never allocates or loses saved c
     const cases = [_]Case{
         .{ .parent = false, .state = null, .wire_state = null },
         .{ .parent = true, .state = null, .wire_state = null },
-        .{ .parent = false, .state = "vendor=value", .wire_state = "" },
+        .{ .parent = false, .state = "vendor=value", .wire_state = null },
         .{ .parent = true, .state = "vendor=value", .wire_state = "vendor=value" },
-        .{ .parent = true, .state = "invalid=has=equals", .wire_state = "" },
+        .{ .parent = true, .state = "invalid=has=equals", .wire_state = null },
         .{ .parent = true, .state = "", .wire_state = "" },
         .{ .parent = true, .state = " \t", .wire_state = " \t" },
         .{ .parent = true, .state = "vendor=value,", .wire_state = "vendor=value," },
         .{ .parent = true, .state = "vendor=value, ,other=value", .wire_state = "vendor=value, ,other=value" },
         .{ .parent = true, .state = ", , ", .wire_state = ", , " },
     };
-    const Mutation = enum { unrelated, replace_managed, remove_with_room };
+    const Mutation = enum { unrelated, replace_managed, remove_and_fill, clear_and_fill, free_and_fill, replace_and_fill };
     const Policy = struct {
         failing: *std.testing.FailingAllocator,
+        replacement_failing: *std.testing.FailingAllocator,
         mutation: Mutation,
-        saved_count: u32,
+        saved_count: usize,
         additions: usize = 0,
-        return_count: u32 = 0,
-        installed_count: u32 = 0,
+        return_count: usize = 0,
+        installed_count: usize = 0,
         blocked_at: usize = 0,
+        replacement_blocked_at: usize = 0,
         return_error: bool = false,
-        policy: http.HttpPolicy = .{ .processFn = process },
+        mutate_after: bool = false,
+        policy: http.HttpPolicy = .{ .processFn = process, .openFn = open },
 
-        fn remove(request: *http.Request, key: []const u8) void {
-            if (request.headers.fetchRemove(key)) |removed| {
-                request.allocator.free(removed.key);
-                request.allocator.free(removed.value);
-            }
-        }
-
-        fn process(policy: *http.HttpPolicy, request: *http.Request, _: []*http.HttpPolicy, runtime: http.HttpRuntime) !http.Response {
-            const self: *@This() = @fieldParentPtr("policy", policy);
-            try request.setHeader("x-change", "after");
-            remove(request, "x-remove");
+        fn mutate(self: *@This(), request: *http.Request) !void {
             switch (self.mutation) {
                 .unrelated => {},
                 .replace_managed => {
@@ -305,91 +298,147 @@ test "tracing restoration at the map load limit never allocates or loses saved c
                     if (request.getHeader("tracestate") != null)
                         try request.setHeader("tracestate", "policy=value");
                 },
-                .remove_with_room => {
-                    remove(request, "traceparent");
-                    remove(request, "tracestate");
+                .remove_and_fill => {
+                    _ = request.removeHeader("traceparent");
+                    _ = request.removeHeader("tracestate");
+                },
+                .clear_and_fill => {
+                    request.headers.clearRetainingCapacity();
+                    self.additions = 0;
+                },
+                .free_and_fill => {
+                    request.headers.clearAndFree();
+                    self.additions = 0;
+                },
+                .replace_and_fill => {
+                    request.headers.deinit();
+                    request.headers = http.RequestHeaders.init(self.replacement_failing.allocator());
+                    self.additions = 0;
                 },
             }
-            const reserve = if (self.mutation == .remove_with_room) self.saved_count else 0;
-            while (request.headers.unmanaged.available > reserve) {
+            try request.setHeader("x-change", "after");
+            _ = request.removeHeader("x-remove");
+            try request.headers.ensureUnusedCapacity(16);
+            while (request.headers.unusedCapacity() > 0) {
                 var name: [32]u8 = undefined;
                 try request.setHeader(std.fmt.bufPrint(&name, "x-added-{d}", .{self.additions}) catch unreachable, "retained");
                 self.additions += 1;
             }
             self.return_count = request.headers.count();
-            self.installed_count = @as(u32, @intFromBool(request.getHeader("traceparent") != null)) +
+            self.installed_count = @as(usize, @intFromBool(request.getHeader("traceparent") != null)) +
                 @intFromBool(request.getHeader("tracestate") != null);
             self.blocked_at = self.failing.alloc_index;
             self.failing.fail_index = self.blocked_at;
+            self.replacement_blocked_at = self.replacement_failing.alloc_index;
+            self.replacement_failing.fail_index = self.replacement_blocked_at;
+        }
+
+        fn process(policy: *http.HttpPolicy, request: *http.Request, _: []*http.HttpPolicy, runtime: http.HttpRuntime) !http.Response {
+            const self: *@This() = @fieldParentPtr("policy", policy);
+            if (!self.mutate_after) try self.mutate(request);
+            var response = try runtime.transport.send(request);
+            errdefer response.deinit();
+            if (self.mutate_after) try self.mutate(request);
             if (self.return_error) return error.TestPolicyFailure;
-            return runtime.transport.send(request);
+            return response;
+        }
+
+        fn open(policy: *http.HttpPolicy, request: *http.Request, options: http.OpenOptions, _: []*http.HttpPolicy, runtime: http.HttpRuntime) !*http.HttpOperation {
+            const self: *@This() = @fieldParentPtr("policy", policy);
+            if (!self.mutate_after) try self.mutate(request);
+            const operation = try runtime.transport.open(request, options);
+            errdefer operation.deinit();
+            if (self.mutate_after) try self.mutate(request);
+            if (self.return_error) return error.TestPolicyFailure;
+            return operation;
         }
     };
     for (cases) |case| {
-        inline for (.{ Mutation.unrelated, Mutation.replace_managed, Mutation.remove_with_room }) |mutation| {
-            var crypto = crypto_mod.StdCryptoProvider.init(std.testing.io);
-            var mock = http.MockTransport.init(allocator, 200, "");
-            defer mock.deinit();
-            const runtime = http.HttpRuntime.init(mock.asTransport(), crypto.asProvider());
-            var probe: Probe = .{};
-            var provider = try Provider.init(allocator, std.testing.io, runtime.crypto, &probe.exporter, .{});
-            defer provider.deinit() catch unreachable;
-            var failing = std.testing.FailingAllocator.init(allocator, .{});
-            var request = http.Request.init(failing.allocator(), .GET, "https://example.test");
-            defer request.deinit();
-            if (case.parent) try request.setHeader("TraceParent", original_parent);
-            if (case.state) |state| try request.setHeader("TraceState", state);
-            try request.setHeader("x-change", "before");
-            try request.setHeader("x-remove", "remove me");
-            var policy: Policy = .{
-                .failing = &failing,
-                .mutation = mutation,
-                .saved_count = @as(u32, @intFromBool(case.parent)) + @intFromBool(case.state != null),
-            };
-            var policies = [_]*http.HttpPolicy{&policy.policy};
-            var pipeline = pipelineFor(runtime, &provider, &policies);
-            // Reuse the same request, including a service/policy error return.
-            for (0..2) |call| {
-                failing.fail_index = std.math.maxInt(usize);
-                policy.return_error = call == 1;
-                if (policy.return_error) {
-                    try std.testing.expectError(error.TestPolicyFailure, pipeline.send(&request));
-                } else {
-                    var response = try pipeline.send(&request);
-                    defer response.deinit();
-                    try std.testing.expectEqual(@as(u16, 200), response.status_code);
-                    if (mutation == .unrelated) {
-                        if (case.wire_state) |state|
-                            try std.testing.expectEqualStrings(state, mock.last_headers.get("tracestate").?)
+        for (std.enums.values(Mutation)) |mutation| {
+            for ([_]bool{ false, true }) |mutate_after| {
+                for ([_]bool{ false, true }) |streaming| {
+                    var crypto = crypto_mod.StdCryptoProvider.init(std.testing.io);
+                    var mock = http.MockTransport.init(allocator, 200, "");
+                    defer mock.deinit();
+                    const runtime = http.HttpRuntime.init(mock.asTransport(), crypto.asProvider());
+                    var probe: Probe = .{};
+                    var provider = try Provider.init(allocator, std.testing.io, runtime.crypto, &probe.exporter, .{});
+                    defer provider.deinit() catch unreachable;
+                    var failing = std.testing.FailingAllocator.init(allocator, .{});
+                    var replacement_failing = std.testing.FailingAllocator.init(allocator, .{});
+                    var request = http.Request.init(failing.allocator(), .GET, "https://example.test");
+                    defer request.deinit();
+                    if (case.parent) try request.setHeader("TraceParent", original_parent);
+                    if (case.state) |state| try request.setHeader("TraceState", state);
+                    try request.setHeader("x-change", "before");
+                    try request.setHeader("x-remove", "remove me");
+                    var policy: Policy = .{
+                        .failing = &failing,
+                        .replacement_failing = &replacement_failing,
+                        .mutation = mutation,
+                        .saved_count = @as(usize, @intFromBool(case.parent)) + @intFromBool(case.state != null),
+                        .mutate_after = mutate_after,
+                    };
+                    var policies = [_]*http.HttpPolicy{&policy.policy};
+                    var pipeline = pipelineFor(runtime, &provider, &policies);
+                    // Reuse the same request, including a service/policy error return.
+                    for (0..2) |call| {
+                        failing.fail_index = std.math.maxInt(usize);
+                        replacement_failing.fail_index = std.math.maxInt(usize);
+                        policy.return_error = call == 1;
+                        if (policy.return_error) {
+                            if (streaming)
+                                try std.testing.expectError(error.TestPolicyFailure, pipeline.open(&request, .{}))
+                            else
+                                try std.testing.expectError(error.TestPolicyFailure, pipeline.send(&request));
+                        } else {
+                            if (streaming) {
+                                const operation = try pipeline.open(&request, .{});
+                                defer operation.deinit();
+                                try std.testing.expectEqual(@as(u16, 200), operation.status_code);
+                                try operation.finish();
+                            } else {
+                                var response = try pipeline.send(&request);
+                                defer response.deinit();
+                                try std.testing.expectEqual(@as(u16, 200), response.status_code);
+                            }
+                            if (mutation == .unrelated or mutate_after) {
+                                if (case.wire_state) |state|
+                                    try std.testing.expectEqualStrings(state, mock.last_headers.get("tracestate").?)
+                                else
+                                    try std.testing.expect(mock.last_headers.get("tracestate") == null);
+                            }
+                        }
+                        try std.testing.expect(!failing.has_induced_failure);
+                        try std.testing.expect(!replacement_failing.has_induced_failure);
+                        try std.testing.expectEqual(policy.blocked_at, failing.alloc_index);
+                        try std.testing.expectEqual(policy.replacement_blocked_at, replacement_failing.alloc_index);
+                        try std.testing.expectEqual(@as(usize, 0), request.headers.unusedCapacity());
+                        try std.testing.expectEqual(policy.return_count - policy.installed_count + policy.saved_count, request.headers.count());
+                        if (case.parent)
+                            try std.testing.expectEqualStrings(original_parent, request.getHeader("traceparent").?)
                         else
-                            try std.testing.expect(mock.last_headers.get("tracestate") == null);
+                            try std.testing.expect(request.getHeader("traceparent") == null);
+                        if (case.state) |state|
+                            try std.testing.expectEqualStrings(state, request.getHeader("tracestate").?)
+                        else
+                            try std.testing.expect(request.getHeader("tracestate") == null);
+                        try std.testing.expectEqualStrings("after", request.getHeader("x-change").?);
+                        try std.testing.expect(request.getHeader("x-remove") == null);
+                        for (0..policy.additions) |i| {
+                            var name: [32]u8 = undefined;
+                            const key = std.fmt.bufPrint(&name, "x-added-{d}", .{i}) catch unreachable;
+                            try std.testing.expectEqualStrings("retained", request.getHeader(key).?);
+                        }
+                    }
+                    try std.testing.expectEqual(@as(u64, 0), provider.stats().propagation_errors);
+                    try provider.shutdown(1000);
+                    try std.testing.expectEqual(@as(usize, 2), probe.count);
+                    if (case.parent) {
+                        for (probe.parents[0..2]) |parent|
+                            try std.testing.expectEqualStrings("b7ad6b7169203331", &parent.?);
                     }
                 }
-                try std.testing.expect(!failing.has_induced_failure);
-                try std.testing.expectEqual(policy.blocked_at, failing.alloc_index);
-                try std.testing.expectEqual(policy.return_count - policy.installed_count + policy.saved_count, request.headers.count());
-                if (case.parent)
-                    try std.testing.expectEqualStrings(original_parent, request.getHeader("traceparent").?)
-                else
-                    try std.testing.expect(request.getHeader("traceparent") == null);
-                if (case.state) |state|
-                    try std.testing.expectEqualStrings(state, request.getHeader("tracestate").?)
-                else
-                    try std.testing.expect(request.getHeader("tracestate") == null);
-                try std.testing.expectEqualStrings("after", request.getHeader("x-change").?);
-                try std.testing.expect(request.getHeader("x-remove") == null);
-                for (0..policy.additions) |i| {
-                    var name: [32]u8 = undefined;
-                    const key = std.fmt.bufPrint(&name, "x-added-{d}", .{i}) catch unreachable;
-                    try std.testing.expectEqualStrings("retained", request.getHeader(key).?);
-                }
-            }
-            try std.testing.expectEqual(@as(u64, 0), provider.stats().propagation_errors);
-            try provider.shutdown(1000);
-            try std.testing.expectEqual(@as(usize, 2), probe.count);
-            if (case.parent) {
-                for (probe.parents[0..2]) |parent|
-                    try std.testing.expectEqualStrings("b7ad6b7169203331", &parent.?);
             }
         }
     }
