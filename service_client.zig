@@ -7,7 +7,7 @@ fn testingRuntime(http_transport: core.http.HttpTransport) core.http.HttpRuntime
     return .init(http_transport, testing_crypto_provider.asProvider());
 }
 const auth = @import("auth.zig");
-const connection_string = @import("connection_string.zig");
+const Configuration = @import("client_configuration.zig").Configuration;
 const client = @import("client.zig");
 const options = @import("options.zig");
 const pipeline = @import("pipeline.zig");
@@ -20,9 +20,10 @@ const service_models = @import("service_models.zig");
 
 /// Client for Azure Table Service operations (list/create/delete tables).
 ///
-/// The credential, configured policy objects, and runtime backend contexts are
-/// borrowed and must outlive the client and in-flight calls. The client owns
-/// its endpoint, API version, policy pointer list, and bearer-token cache.
+/// Explicit credentials, configured policies, and runtime backend contexts
+/// are borrowed and must outlive the client and in-flight calls. The client owns
+/// its endpoint, API version, policy pointer list, bearer-token cache, and any
+/// credential created from a connection string.
 /// Calls must be serialized because the token cache and standard transport are
 /// mutable and not thread-safe.
 pub const TableServiceClient = struct {
@@ -32,104 +33,34 @@ pub const TableServiceClient = struct {
     owned_credential: ?*auth.SharedKeyCredential = null,
 
     pub const Options = options.TableServiceClientOptions;
+    pub const InitOptions = options.TableServiceClientInitOptions;
 
-    pub fn initWithToken(
+    pub fn init(
         allocator: std.mem.Allocator,
-        endpoint: []const u8,
-        credential: *core.credentials.TokenCredential,
         runtime: core.http.HttpRuntime,
-        init_options: Options,
+        init_options: InitOptions,
     ) !TableServiceClient {
-        try request.validateTokenEndpoint(endpoint);
-        const state = try pipeline.PipelineState.create(
-            allocator,
-            credential,
-            runtime,
-            init_options,
-        );
+        var configuration = try Configuration.init(allocator, init_options.authentication);
+        defer configuration.deinit();
+        const state = try configuration.createPipeline(runtime, init_options.options);
         errdefer state.deinit();
         const protocol = try protocol_client.ProtocolClient.init(
             allocator,
-            endpoint,
+            configuration.endpoint,
             state.pipeline,
             .{
-                .api_version = init_options.api_version,
+                .api_version = init_options.options.api_version,
                 .endpoint_query_is_sas = state.usesSas(),
             },
         );
+        const owned_credential = configuration.owned_credential;
+        configuration.owned_credential = null;
         return .{
             .allocator = allocator,
             .protocol = protocol,
             .pipeline_state = state,
+            .owned_credential = owned_credential,
         };
-    }
-
-    /// Creates a SharedKeyLite-authenticated service client. The credential is
-    /// borrowed and must outlive the client.
-    pub fn initWithSharedKey(
-        allocator: std.mem.Allocator,
-        endpoint: []const u8,
-        credential: *auth.SharedKeyCredential,
-        runtime: core.http.HttpRuntime,
-        init_options: Options,
-    ) !TableServiceClient {
-        try request.validateSharedKeyEndpoint(endpoint);
-        const state = try pipeline.PipelineState.createSharedKey(allocator, credential, runtime, init_options);
-        errdefer state.deinit();
-        const protocol = try protocol_client.ProtocolClient.init(
-            allocator,
-            endpoint,
-            state.pipeline,
-            .{
-                .api_version = init_options.api_version,
-                .endpoint_query_is_sas = state.usesSas(),
-            },
-        );
-        return .{ .allocator = allocator, .protocol = protocol, .pipeline_state = state };
-    }
-
-    /// Creates a credential-free service client from a complete SAS URL.
-    pub fn initWithSasUrl(
-        allocator: std.mem.Allocator,
-        complete_sas_url: []const u8,
-        runtime: core.http.HttpRuntime,
-        init_options: Options,
-    ) !TableServiceClient {
-        try request.validateSasEndpoint(complete_sas_url);
-        const state = try pipeline.PipelineState.createNoAuth(allocator, runtime, init_options);
-        errdefer state.deinit();
-        const protocol = try protocol_client.ProtocolClient.init(
-            allocator,
-            complete_sas_url,
-            state.pipeline,
-            .{
-                .api_version = init_options.api_version,
-                .endpoint_query_is_sas = state.usesSas(),
-            },
-        );
-        return .{ .allocator = allocator, .protocol = protocol, .pipeline_state = state };
-    }
-
-    /// Parses a Storage or Azurite connection string before constructing the
-    /// pipeline. Account-key credentials are owned by the returned client.
-    pub fn initFromConnectionString(
-        allocator: std.mem.Allocator,
-        value: []const u8,
-        runtime: core.http.HttpRuntime,
-        init_options: Options,
-    ) !TableServiceClient {
-        var parsed = try connection_string.parse(allocator, value);
-        defer parsed.deinit();
-        if (parsed.account_key) |key| {
-            const credential = try allocator.create(auth.SharedKeyCredential);
-            errdefer allocator.destroy(credential);
-            credential.* = try auth.SharedKeyCredential.init(allocator, parsed.account_name, key);
-            errdefer credential.deinit();
-            var result = try initWithSharedKey(allocator, parsed.endpoint, credential, runtime, init_options);
-            result.owned_credential = credential;
-            return result;
-        }
-        return initWithSasUrl(allocator, parsed.endpoint, runtime, init_options);
     }
 
     /// Creates a table client that shares this service client's pipeline,
@@ -139,31 +70,38 @@ pub const TableServiceClient = struct {
         self: *TableServiceClient,
         table_name: []const u8,
     ) !client.TableClient {
-        if (self.protocol.endpoint.has_query) {
-            const endpoint = try std.fmt.allocPrint(
+        try request.validateTableName(table_name);
+        const sas_endpoint = if (self.protocol.endpoint.has_query)
+            try std.fmt.allocPrint(
                 self.allocator,
                 "{s}?{s}",
                 .{
                     self.protocol.endpoint.base_url,
                     self.protocol.endpoint.raw_query,
                 },
-            );
-            defer self.allocator.free(endpoint);
-            return client.TableClient.initBorrowed(
-                self.allocator,
-                endpoint,
-                table_name,
-                self.protocol.api_version,
-                self.pipeline_state,
-            );
-        }
-        return client.TableClient.initBorrowed(
+            )
+        else
+            null;
+        defer if (sas_endpoint) |endpoint| self.allocator.free(endpoint);
+        var protocol = try protocol_client.ProtocolClient.init(
             self.allocator,
-            self.protocol.endpoint.base_url,
-            table_name,
-            self.protocol.api_version,
-            self.pipeline_state,
+            sas_endpoint orelse self.protocol.endpoint.base_url,
+            self.pipeline_state.pipeline,
+            .{
+                .api_version = self.protocol.api_version,
+                .endpoint_query_is_sas = self.pipeline_state.usesSas(),
+                .mutation_retry = self.pipeline_state.retryOptions(),
+                .default_operation_timeout_ms = self.pipeline_state.operationTimeoutMs(),
+            },
         );
+        errdefer protocol.deinit();
+        return .{
+            .allocator = self.allocator,
+            .protocol = protocol,
+            .table_name = try self.allocator.dupe(u8, table_name),
+            .pipeline_state = self.pipeline_state,
+            .owns_pipeline_state = false,
+        };
     }
 
     pub fn deinit(self: *TableServiceClient) void {
@@ -406,6 +344,9 @@ const CountingCredential = struct {
 const CountingCryptoProvider = struct {
     inner: core.crypto.CryptoProvider,
     hmac_calls: usize = 0,
+    random_calls: usize = 0,
+    fail_random: bool = false,
+    fail_hmac: bool = false,
 
     const vtable: core.crypto.CryptoProvider.VTable = .{
         .random_bytes = &randomBytes,
@@ -424,7 +365,10 @@ const CountingCryptoProvider = struct {
     }
 
     fn randomBytes(context: *anyopaque, out: []u8) !void {
-        return fromContext(context).inner.randomBytes(out);
+        const counting = fromContext(context);
+        counting.random_calls += 1;
+        if (counting.fail_random) return error.CryptoEntropyFailure;
+        return counting.inner.randomBytes(out);
     }
 
     fn md5(
@@ -451,6 +395,7 @@ const CountingCryptoProvider = struct {
     ) !void {
         const counting = fromContext(context);
         counting.hmac_calls += 1;
+        if (counting.fail_hmac) return error.CryptoSigningFailure;
         out.* = try counting.inner.hmacSha256(key, message);
     }
 
@@ -467,6 +412,56 @@ const MovedServicePager = struct {
     table_pager: pager.TablePager,
 };
 
+test "canonical direct and derived clients preserve provider failures before dispatch" {
+    const allocator = std.testing.allocator;
+    var transport = core.http.MockTransport.init(allocator, 200, "{}");
+    defer transport.deinit();
+    var standard = core.crypto.StdCryptoProvider.init(std.testing.io);
+    var crypto = CountingCryptoProvider{ .inner = standard.asProvider() };
+    const runtime = core.http.HttpRuntime.init(transport.asTransport(), crypto.provider());
+    var key = try auth.SharedKeyCredential.init(allocator, "account", "YWNjb3VudC1rZXk=");
+    defer key.deinit();
+    const inputs = [_]options.ClientAuthentication{
+        .{ .shared_key = .{ .endpoint = "https://account.table.core.windows.net", .credential = &key } },
+        .{ .connection_string = "AccountName=account;AccountKey=YWNjb3VudC1rZXk=;TableEndpoint=https://account.table.core.windows.net" },
+    };
+    for (inputs) |input| {
+        var direct = try client.TableClient.init(allocator, runtime, .{
+            .authentication = input,
+            .table_name = "People",
+            .options = .{ .retry = .{ .max_retries = 0 } },
+        });
+        defer direct.deinit();
+        var service = try TableServiceClient.init(allocator, runtime, .{
+            .authentication = input,
+            .options = .{ .retry = .{ .max_retries = 0 } },
+        });
+        defer service.deinit();
+        var derived = try service.getTableClient("People");
+        defer derived.deinit();
+        for ([_]*client.TableClient{ &direct, &derived }) |table| {
+            const dispatched = transport.call_count;
+            const random_calls = crypto.random_calls;
+            const hmac_calls = crypto.hmac_calls;
+            crypto.fail_random = true;
+            try std.testing.expectError(error.CryptoEntropyFailure, table.getEntityRaw(allocator, "p", "r"));
+            try std.testing.expectEqual(dispatched, transport.call_count);
+            try std.testing.expectEqual(random_calls + 1, crypto.random_calls);
+            try std.testing.expectEqual(hmac_calls, crypto.hmac_calls);
+            crypto.fail_random = false;
+            crypto.fail_hmac = true;
+            try std.testing.expectError(error.CryptoSigningFailure, table.getEntityRaw(allocator, "p", "r"));
+            try std.testing.expectEqual(dispatched, transport.call_count);
+            try std.testing.expectEqual(hmac_calls + 1, crypto.hmac_calls);
+            crypto.fail_hmac = false;
+            var response = try table.getEntityRaw(allocator, "p", "r");
+            response.deinit();
+            try std.testing.expectEqual(dispatched + 1, transport.call_count);
+            try std.testing.expect(std.mem.startsWith(u8, transport.last_headers.get("Authorization").?, "SharedKeyLite account:"));
+        }
+    }
+}
+
 fn moveServiceWithPager(
     service: TableServiceClient,
     allocator: std.mem.Allocator,
@@ -482,12 +477,10 @@ test "derived clients share token cache and transport and borrow pipeline state"
     defer transport.deinit();
     var credential = CountingCredential{};
 
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } } },
     );
     defer service.deinit();
     const shared_state = service.pipeline_state;
@@ -532,12 +525,10 @@ test "table pager survives a service client move across continuation pages" {
     };
     var transport = core.http.SequenceMockTransport.init(allocator, &pages);
     var credential = CountingCredential{};
-    var source = try TableServiceClient.initWithToken(
+    var source = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } } },
     );
     var moved = try moveServiceWithPager(source, allocator);
     source = undefined;
@@ -566,12 +557,10 @@ test "token service client rejects HTTP before credential and transport use" {
 
     try std.testing.expectError(
         error.TokenAuthenticationRequiresHttps,
-        TableServiceClient.initWithToken(
+        TableServiceClient.init(
             allocator,
-            "http://tables.private.example:10002/account",
-            credential.asCredential(),
             testingRuntime(transport.asTransport()),
-            .{},
+            .{ .authentication = .{ .token = .{ .endpoint = "http://tables.private.example:10002/account", .credential = credential.asCredential() } } },
         ),
     );
     try std.testing.expectEqual(@as(usize, 0), credential.calls);
@@ -584,12 +573,10 @@ test "token service client accepts HTTPS custom private endpoint" {
     defer transport.deinit();
     var credential = CountingCredential{};
 
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://tables.private.example:8443/account/path/",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = "https://tables.private.example:8443/account/path/", .credential = credential.asCredential() } } },
     );
     defer service.deinit();
 
@@ -613,12 +600,11 @@ test "connection-string account SAS uses selected runtime crypto provider" {
         transport.asTransport(),
         counting_crypto.provider(),
     );
-    var shared = try TableServiceClient.initFromConnectionString(
+    var shared = try TableServiceClient.init(
         allocator,
-        "DefaultEndpointsProtocol=https;AccountName=fakeaccount;" ++
-            "AccountKey=ZmFrZS1rZXk=;EndpointSuffix=core.windows.net",
         runtime,
-        .{},
+        .{ .authentication = .{ .connection_string = "DefaultEndpointsProtocol=https;AccountName=fakeaccount;" ++
+            "AccountKey=ZmFrZS1rZXk=;EndpointSuffix=core.windows.net" } },
     );
     defer shared.deinit();
 
@@ -635,11 +621,10 @@ test "connection-string account SAS uses selected runtime crypto provider" {
     );
     try std.testing.expectEqual(@as(usize, 1), counting_crypto.hmac_calls);
 
-    var anonymous = try TableServiceClient.initWithSasUrl(
+    var anonymous = try TableServiceClient.init(
         allocator,
-        sas_url,
         runtime,
-        .{},
+        .{ .authentication = .{ .sas_url = sas_url } },
     );
     defer anonymous.deinit();
     try std.testing.expectError(
@@ -670,12 +655,13 @@ test "table lifecycle result variants preserve generated responses and service e
         .{ .name = "x-ms-request-id", .value = "create-id" },
     };
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{ .client_request_id = "lifecycle-request" },
+        .{
+            .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } },
+            .options = .{ .client_request_id = "lifecycle-request" },
+        },
     );
     defer service.deinit();
 
@@ -720,12 +706,10 @@ test "table lifecycle validates names before transport and table clients are con
         .{ .name = "Date", .value = "Sun, 26 Jul 2026 00:00:00 GMT" },
     };
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } } },
     );
     defer service.deinit();
 
@@ -762,12 +746,10 @@ test "table lifecycle uses Shared Key and SAS pipeline authentication" {
         "YWNjb3VudC1rZXk=",
     );
     defer shared_credential.deinit();
-    var shared = try TableServiceClient.initWithSharedKey(
+    var shared = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        &shared_credential,
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .shared_key = .{ .endpoint = "https://account.table.core.windows.net", .credential = &shared_credential } } },
     );
     defer shared.deinit();
     var created = try shared.createTable(allocator, "Table123", .{});
@@ -778,11 +760,10 @@ test "table lifecycle uses Shared Key and SAS pipeline authentication" {
         "SharedKeyLite account:",
     ));
 
-    var sas_client = try TableServiceClient.initWithSasUrl(
+    var sas_client = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1%2F2&sig=secret%3D&sp=r",
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1%2F2&sig=secret%3D&sp=r" } },
     );
     defer sas_client.deinit();
     var deleted = try sas_client.deleteTable(allocator, "Table123", .{});
@@ -820,12 +801,10 @@ test "table lifecycle retains all documented table service failure codes" {
             .{ .name = "x-ms-request-id", .value = "failure-id" },
         };
         var credential = CountingCredential{};
-        var service = try TableServiceClient.initWithToken(
+        var service = try TableServiceClient.init(
             allocator,
-            "https://account.table.core.windows.net",
-            credential.asCredential(),
             testingRuntime(transport.asTransport()),
-            .{},
+            .{ .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } } },
         );
         defer service.deinit();
 
@@ -850,12 +829,13 @@ fn testLifecycleAllocationFailures(allocator: std.mem.Allocator) !void {
         .{ .name = "Date", .value = "Sun, 26 Jul 2026 00:00:00 GMT" },
     };
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{ .retry = .{ .max_retries = 0 } },
+        .{
+            .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } },
+            .options = .{ .retry = .{ .max_retries = 0 } },
+        },
     );
     defer service.deinit();
     var result = try service.createTableResult(allocator, "Table123", .{});
@@ -881,12 +861,13 @@ test "service properties use generated XML and preserve response metadata" {
     var capture = BodyCapturePolicy{ .allocator = allocator };
     defer capture.deinit();
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{ .policies = &.{&capture.policy} },
+        .{
+            .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } },
+            .options = .{ .policies = &.{&capture.policy} },
+        },
     );
     defer service.deinit();
 
@@ -970,12 +951,10 @@ test "service administration validates before transport and returns structured f
         .{ .name = "x-ms-version", .value = "2019-02-02" },
     };
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } } },
     );
     defer service.deinit();
 
@@ -1030,12 +1009,10 @@ test "secondary statistics preserve unknown replication status and UTC time" {
         .{ .name = "Content-Type", .value = "application/xml" },
     };
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account-secondary.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = "https://account-secondary.table.core.windows.net", .credential = credential.asCredential() } } },
     );
     defer service.deinit();
 
@@ -1073,12 +1050,10 @@ test "malformed service properties XML is released on decode failure" {
         .{ .name = "Content-Type", .value = "application/xml" },
     };
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } } },
     );
     defer service.deinit();
 
@@ -1096,12 +1071,13 @@ fn testServiceAdminAllocationFailures(allocator: std.mem.Allocator) !void {
         .{ .name = "x-ms-version", .value = "2019-02-02" },
     };
     var credential = CountingCredential{};
-    var service = try TableServiceClient.initWithToken(
+    var service = try TableServiceClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        credential.asCredential(),
         testingRuntime(transport.asTransport()),
-        .{ .retry = .{ .max_retries = 0 } },
+        .{
+            .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = credential.asCredential() } },
+            .options = .{ .retry = .{ .max_retries = 0 } },
+        },
     );
     defer service.deinit();
     var response = try service.setServiceProperties(allocator, .{

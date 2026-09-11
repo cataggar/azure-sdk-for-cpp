@@ -1204,12 +1204,10 @@ test "automatic transaction boundaries use the selected runtime provider" {
         mock.asTransport(),
         crypto.provider(),
     );
-    var client = try client_mod.TableClient.initWithSasUrl(
+    var client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         runtime,
-        .{},
+        .{ .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" }, .table_name = "People" },
     );
     defer client.deinit();
     var builder = TransactionBuilder.init(allocator);
@@ -1246,12 +1244,10 @@ test "boundary provider failure prevents send and explicit boundaries bypass it"
         mock.asTransport(),
         crypto.provider(),
     );
-    var client = try client_mod.TableClient.initWithSasUrl(
+    var client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         runtime,
-        .{},
+        .{ .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" }, .table_name = "People" },
     );
     defer client.deinit();
     var builder = TransactionBuilder.init(allocator);
@@ -1292,12 +1288,10 @@ fn expectIndeterminateTransactionResponse(
     var mock = core.http.MockTransport.init(allocator, status, body);
     defer mock.deinit();
     mock.response_headers_list = headers;
-    var client = try client_mod.TableClient.initWithSasUrl(
+    var client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         testingRuntime(mock.asTransport()),
-        .{},
+        .{ .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" }, .table_name = "People" },
     );
     defer client.deinit();
     var builder = TransactionBuilder.init(allocator);
@@ -1355,12 +1349,10 @@ test "submitted transaction inner failure remains a precise indexed TableError" 
     var mock = core.http.MockTransport.init(allocator, 202, one_failure_body);
     defer mock.deinit();
     mock.response_headers_list = transaction_response_headers;
-    var client = try client_mod.TableClient.initWithSasUrl(
+    var client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         testingRuntime(mock.asTransport()),
-        .{},
+        .{ .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" }, .table_name = "People" },
     );
     defer client.deinit();
     var builder = TransactionBuilder.init(allocator);
@@ -1432,31 +1424,20 @@ fn expectTransactionRedirectRejected(
         "ZmFrZS1rZXk=",
     );
     defer shared_credential.deinit();
-    var client = switch (auth_mode) {
-        .bearer => try client_mod.TableClient.initWithToken(
-            allocator,
-            "https://account.table.core.windows.net",
-            "People",
-            &test_credential.credential,
-            testingRuntime(transport.asTransport()),
-            .{},
-        ),
-        .shared_key => try client_mod.TableClient.initWithSharedKey(
-            allocator,
-            "https://account.table.core.windows.net",
-            "People",
-            &shared_credential,
-            testingRuntime(transport.asTransport()),
-            .{},
-        ),
-        .sas => try client_mod.TableClient.initWithSasUrl(
-            allocator,
-            "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-            "People",
-            testingRuntime(transport.asTransport()),
-            .{},
-        ),
-    };
+    var client = try client_mod.TableClient.init(allocator, testingRuntime(transport.asTransport()), .{
+        .authentication = switch (auth_mode) {
+            .bearer => .{ .token = .{
+                .endpoint = "https://account.table.core.windows.net",
+                .credential = &test_credential.credential,
+            } },
+            .shared_key => .{ .shared_key = .{
+                .endpoint = "https://account.table.core.windows.net",
+                .credential = &shared_credential,
+            } },
+            .sas => .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" },
+        },
+        .table_name = "People",
+    });
     defer client.deinit();
     var builder = TransactionBuilder.init(allocator);
     defer builder.deinit();
@@ -1568,12 +1549,14 @@ test "transaction POST retries pretransport failure but not ambiguous transport 
     var mock = core.http.MockTransport.init(allocator, 202, one_success_body);
     defer mock.deinit();
     mock.response_headers_list = transaction_response_headers;
-    var client = try client_mod.TableClient.initWithSasUrl(
+    var client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         testingRuntime(mock.asTransport()),
-        .{ .retry = .{ .max_retries = 1, .initial_delay_ms = 0, .max_delay_ms = 0 } },
+        .{
+            .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" },
+            .table_name = "People",
+            .options = .{ .retry = .{ .max_retries = 1, .initial_delay_ms = 0, .max_delay_ms = 0 } },
+        },
     );
     defer client.deinit();
     var result = try client.submitTransactionResult(allocator, &builder, .{
@@ -1589,12 +1572,14 @@ test "transaction POST retries pretransport failure but not ambiguous transport 
     try std.testing.expect(std.mem.indexOf(u8, mock.last_url.?, "sig=SECRET") != null);
 
     var failing = FailingTransactionTransport{};
-    var failing_client = try client_mod.TableClient.initWithSasUrl(
+    var failing_client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         testingRuntime(failing.asTransport()),
-        .{ .retry = .{ .max_retries = 5, .initial_delay_ms = 0, .max_delay_ms = 0 } },
+        .{
+            .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" },
+            .table_name = "People",
+            .options = .{ .retry = .{ .max_retries = 5, .initial_delay_ms = 0, .max_delay_ms = 0 } },
+        },
     );
     defer failing_client.deinit();
     try std.testing.expectError(
@@ -1606,12 +1591,10 @@ test "transaction POST retries pretransport failure but not ambiguous transport 
     try std.testing.expectEqual(@as(usize, 1), failing.calls);
 
     var timed_out = FailingTransactionTransport{ .failure = error.OperationTimedOut };
-    var timeout_client = try client_mod.TableClient.initWithSasUrl(
+    var timeout_client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         testingRuntime(timed_out.asTransport()),
-        .{},
+        .{ .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" }, .table_name = "People" },
     );
     defer timeout_client.deinit();
     try std.testing.expectError(
@@ -1630,12 +1613,14 @@ test "transaction pretransport retries honor operation time budget" {
     var mock = core.http.MockTransport.init(allocator, 202, one_success_body);
     defer mock.deinit();
     mock.response_headers_list = transaction_response_headers;
-    var client = try client_mod.TableClient.initWithSasUrl(
+    var client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         testingRuntime(mock.asTransport()),
-        .{ .retry = .{ .max_retries = 5, .initial_delay_ms = 50, .max_delay_ms = 50 } },
+        .{
+            .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" },
+            .table_name = "People",
+            .options = .{ .retry = .{ .max_retries = 5, .initial_delay_ms = 50, .max_delay_ms = 50 } },
+        },
     );
     defer client.deinit();
     var builder = TransactionBuilder.init(allocator);
@@ -1666,13 +1651,13 @@ test "transaction submission uses bearer and SharedKey authentication" {
     defer bearer_mock.deinit();
     bearer_mock.response_headers_list = transaction_response_headers;
     var test_credential = TestCredential.init();
-    var bearer = try client_mod.TableClient.initWithToken(
+    var bearer = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        "People",
-        &test_credential.credential,
         testingRuntime(bearer_mock.asTransport()),
-        .{},
+        .{
+            .authentication = .{ .token = .{ .endpoint = "https://account.table.core.windows.net", .credential = &test_credential.credential } },
+            .table_name = "People",
+        },
     );
     defer bearer.deinit();
     var bearer_result = try bearer.submitTransactionResult(allocator, &builder, .{
@@ -1693,13 +1678,13 @@ test "transaction submission uses bearer and SharedKey authentication" {
         "ZmFrZS1rZXk=",
     );
     defer credential.deinit();
-    var shared = try client_mod.TableClient.initWithSharedKey(
+    var shared = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net",
-        "People",
-        &credential,
         testingRuntime(shared_mock.asTransport()),
-        .{},
+        .{
+            .authentication = .{ .shared_key = .{ .endpoint = "https://account.table.core.windows.net", .credential = &credential } },
+            .table_name = "People",
+        },
     );
     defer shared.deinit();
     var shared_result = try shared.submitTransactionResult(allocator, &builder, .{
@@ -1718,12 +1703,10 @@ test "transaction validation occurs before transport" {
     const allocator = std.testing.allocator;
     var mock = core.http.MockTransport.init(allocator, 202, one_success_body);
     defer mock.deinit();
-    var client = try client_mod.TableClient.initWithSasUrl(
+    var client = try client_mod.TableClient.init(
         allocator,
-        "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a",
-        "People",
         testingRuntime(mock.asTransport()),
-        .{},
+        .{ .authentication = .{ .sas_url = "https://account.table.core.windows.net?sv=1&sig=SECRET&sp=a" }, .table_name = "People" },
     );
     defer client.deinit();
     var empty = TransactionBuilder.init(allocator);

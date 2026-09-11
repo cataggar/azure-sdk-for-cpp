@@ -1,6 +1,6 @@
 .{
     .name = .azure_sdk_data_tables,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0xc49b80127477f0d5,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -24,7 +24,9 @@
         "root.zig",
         "auth.zig",
         "client.zig",
+        "client_configuration.zig",
         "connection_string.zig",
+        "construction_test.zig",
         "edm.zig",
         "entity.zig",
         "entity_codec.zig",

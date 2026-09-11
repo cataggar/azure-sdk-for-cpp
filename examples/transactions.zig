@@ -19,12 +19,13 @@ pub fn main(init: std.process.Init) !void {
     defer transport.deinit();
     var crypto = core.crypto.StdCryptoProvider.init(init.io);
     const runtime = core.http.HttpRuntime.init(transport.asTransport(), crypto.asProvider());
-    var client = try tables.TableClient.initFromConnectionString(
+    var client = try tables.TableClient.init(
         allocator,
-        connection_string,
-        table_name,
         runtime,
-        .{},
+        .{
+            .authentication = .{ .connection_string = connection_string },
+            .table_name = table_name,
+        },
     );
     defer client.deinit();
 

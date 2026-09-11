@@ -77,12 +77,10 @@ test "live Entra, Shared Key, SAS, ACL, properties, and statistics" {
         config.account_key,
     );
     defer shared_key.deinit();
-    var service = try tables.TableServiceClient.initWithSharedKey(
+    var service = try tables.TableServiceClient.init(
         allocator,
-        config.endpoint,
-        &shared_key,
         runtime,
-        .{},
+        .{ .authentication = .{ .shared_key = .{ .endpoint = config.endpoint, .credential = &shared_key } } },
     );
     defer service.deinit();
 
@@ -116,12 +114,10 @@ fn entraSmoke(
     runtime: core.http.HttpRuntime,
 ) !void {
     var credential = core.env_token.EnvTokenCredential.init(allocator, config.bearer);
-    var service = try tables.TableServiceClient.initWithToken(
+    var service = try tables.TableServiceClient.init(
         allocator,
-        config.endpoint,
-        credential.asCredential(),
         runtime,
-        .{},
+        .{ .authentication = .{ .token = .{ .endpoint = config.endpoint, .credential = credential.asCredential() } } },
     );
     defer service.deinit();
     var pager = try service.listTables(allocator, .{ .top = 1 });
@@ -164,11 +160,10 @@ fn sasSmoke(
         .expiryTime = tables.SasUtcTime.fromUnixSeconds(now + 900),
     });
     defer allocator.free(sas_url);
-    var sas = try tables.TableServiceClient.initWithSasUrl(
+    var sas = try tables.TableServiceClient.init(
         allocator,
-        sas_url,
         runtime,
-        .{},
+        .{ .authentication = .{ .sas_url = sas_url } },
     );
     defer sas.deinit();
     var pager = try sas.listTables(allocator, .{ .top = 1 });
@@ -183,12 +178,10 @@ fn serviceAdministrationSmoke(
     shared_key: *tables.SharedKeyCredential,
     runtime: core.http.HttpRuntime,
 ) !void {
-    var statistics_client = try tables.TableServiceClient.initWithSharedKey(
+    var statistics_client = try tables.TableServiceClient.init(
         allocator,
-        secondary_endpoint,
-        shared_key,
         runtime,
-        .{},
+        .{ .authentication = .{ .shared_key = .{ .endpoint = secondary_endpoint, .credential = shared_key } } },
     );
     defer statistics_client.deinit();
     var properties = try primary.getServiceProperties(allocator, .{});

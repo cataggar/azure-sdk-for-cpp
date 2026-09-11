@@ -2,8 +2,9 @@
 
 Hand-written, idiomatic Zig conveniences for **Azure Storage Tables**.
 
-Release branch: `sdk/data_tables`. Version `0.2.0` preserves the prototype
-`TableClient`, `TableServiceClient`, and `TableEntity` exports while the parity roadmap in
+Release branch: `sdk/data_tables`. Package version: `0.3.0`.
+Version 0.3.0 introduces the breaking single-initializer API described below.
+The `TableClient`, `TableServiceClient`, and `TableEntity` exports remain while the parity roadmap in
 [tracker #148](https://github.com/cataggar/azure-sdk-for-zig/issues/148) is
 implemented.
 
@@ -66,10 +67,48 @@ an exact diff against `rest/data_tables`; it removes only its generated output
 under the supplied codegen worktree. It never selects a generic Storage API
 version.
 
+## Canonical construction
+
+Both clients have one constructor, `init(allocator, runtime, init_options)`.
+`TableClient.InitOptions` contains `authentication`, `table_name`, and optional
+`options` (the existing retry, telemetry, request-ID, timeout, and policy settings).
+`TableServiceClient.InitOptions` has the same fields except `table_name`.
+The shared `ClientAuthentication` tagged union selects exactly one input:
+
+| Tag | Input | Ownership |
+|---|---|---|
+| `.token` | `.{ .endpoint = endpoint, .credential = token_credential }` | Credential borrowed |
+| `.shared_key` | `.{ .endpoint = endpoint, .credential = shared_key }` | Credential borrowed |
+| `.sas_url` | Complete signed URL | URL copied; no credential created |
+| `.connection_string` | Storage or Azurite connection string | Parsed strings released after copying; account-key credential owned by client |
+
+```zig
+var service = try tables.TableServiceClient.init(allocator, runtime, .{
+    .authentication = .{ .token = .{
+        .endpoint = endpoint,
+        .credential = credential.asCredential(),
+    } },
+    .options = .{ .retry = .{ .max_retries = 2 } },
+});
+defer service.deinit();
+
+var table = try tables.TableClient.init(allocator, runtime, .{
+    .authentication = .{ .connection_string = connection_string },
+    .table_name = table_name,
+});
+defer table.deinit();
+```
+
+Input strings are borrowed only for initialization; clients copy their endpoint,
+table name, and applicable option strings. Runtime descriptors are copied while
+their backend contexts remain borrowed. Explicit credentials and policy objects
+must outlive owning clients and their derived clients. Do not deinitialize or copy
+an owning client twice. Formatting `ClientAuthentication` redacts its contents.
+
 ## Microsoft Entra authentication
 
 Create owning token-authenticated clients with
-`TableServiceClient.initWithToken` or `TableClient.initWithToken`. Both copy
+`TableServiceClient.init` or `TableClient.init` with `.authentication.token`. Both copy
 their endpoint, API version, telemetry application ID, default client request
 ID, and policy pointer list. Every constructor takes a canonical
 `core.http.HttpRuntime`; its transport and crypto descriptors are copied by
@@ -77,8 +116,8 @@ value while their backend contexts remain borrowed. The credential, runtime
 contexts, and policy objects must outlive the client and all in-flight calls.
 The bearer policy requests
 `https://storage.azure.com/.default`. Token-authenticated constructors require
-HTTPS, including for custom and private endpoint hosts. HTTP remains available
-to future explicit emulator Shared Key and no-token constructors.
+HTTPS, including for custom and private endpoint hosts. HTTP is available only
+to explicit local-emulator Shared Key and SAS authentication.
 
 `TableServiceClient.getTableClient` creates a table client that owns its table
 name and protocol configuration while borrowing the service client's stable
@@ -88,16 +127,16 @@ Derived clients share the parent's bearer-token cache and transport.
 ## Shared Key, SAS, and connection strings
 
 `SharedKeyCredential.init` validates and decodes an account key, and
-`initWithSharedKey` uses the Table-only `SharedKeyLite` canonical form. The
+`.authentication.shared_key` uses the Table-only `SharedKeyLite` canonical form. The
 signer runs after retry, so it applies a current `x-ms-date`, API version, and
 signature to every attempt. Shared Key, connection-string, account SAS, and
 table SAS signing all use the crypto provider selected by the client's
 `HttpRuntime`; provider failures are returned without a standard-provider
-fallback. Use `initWithSasUrl` only with a complete signed
+fallback. Use `.authentication.sas_url` only with a complete signed
 URL; its query bytes are retained verbatim and the pipeline has no
 `Authorization` policy. Client formatting omits all query strings.
 
-`initFromConnectionString` accepts account-key and SAS strings with
+`.authentication.connection_string` accepts account-key and SAS strings with
 `DefaultEndpointsProtocol`, `EndpointSuffix`, or `TableEndpoint`, plus
 `UseDevelopmentStorage=true` for Azurite. It rejects duplicate, unknown, and
 ambiguous fields before creating a pipeline. Token authentication is always
@@ -116,7 +155,7 @@ the canonical Tables version `2019-02-02`.
 `getAccountSasUrl` and `getTableSasUrl` are available only on Shared Key
 clients. Their caller-owned URL results are secrets; SAS value/query formatting
 is redacted. A full generated table URL can be passed directly to
-`TableClient.initWithSasUrl`. It recognizes table scope from one unambiguous,
+`TableClient.init` using `.authentication.sas_url`. It recognizes table scope from one unambiguous,
 decoded `tn` parameter and retains the complete encoded query bytes verbatim;
 account SAS URLs never infer scope from their path.
 
@@ -264,11 +303,11 @@ it does **not** claim that a later roadmap phase is already implemented.
 
 | Checked | Go `sdk/data/aztables` capability | Planned Zig API |
 |---|---|---|
-| [x] | `NewServiceClient` / `NewClient` | `TableServiceClient.initWithToken` / `TableClient.initWithToken` |
-| [x] | `NewServiceClientWithSharedKey` / `NewClientWithSharedKey` | `initWithSharedKey`; Tables-specific `SharedKeyCredential` and SharedKeyLite policy |
+| [x] | `NewServiceClient` / `NewClient` | `TableServiceClient.init` / `TableClient.init` with `.authentication.token` |
+| [x] | `NewServiceClientWithSharedKey` / `NewClientWithSharedKey` | `.authentication.shared_key`; Tables-specific `SharedKeyCredential` and SharedKeyLite policy |
 | [x] | `NewSharedKeyCredential`, account-name access, and key rotation | `auth.SharedKeyCredential.init`, `accountName`, and `updateKey` |
-| [x] | `NewServiceClientWithNoCredential` / `NewClientWithNoCredential` | `initWithSasUrl` |
-| [x] | `NewServiceClientFromConnectionString` | `TableServiceClient.initFromConnectionString` and matching direct table constructor |
+| [x] | `NewServiceClientWithNoCredential` / `NewClientWithNoCredential` | `.authentication.sas_url` |
+| [x] | `NewServiceClientFromConnectionString` | `.authentication.connection_string` in either client's `init` |
 | [x] | Service client `NewClient` | `TableServiceClient.getTableClient` |
 | [x] | Core client options, retry, telemetry, request IDs, cloud token auth | `options`, `pipeline`, and `auth`; Storage bearer scope is `https://storage.azure.com/.default` |
 | [x] | Storage and Azurite connection strings | `connection_string` |
@@ -333,13 +372,22 @@ serialization because the service owns that field. The original
 string-only `TableEntity` remains available as a compatibility export and
 continues to borrow its keys and values.
 
+## Migrating constructors from 0.2.0
+
+Replace the removed `initWithToken`, `initWithSharedKey`, `initWithSasUrl`, and
+`initFromConnectionString` methods with `init(allocator, runtime, init_options)`.
+Move endpoint and credential into the matching `authentication` tag, put the
+table name in `table_name`, and place existing client settings in `options`.
+No compatibility constructor wrappers remain. Use
+`TableServiceClient.getTableClient` instead of the removed internal-facing
+`TableClient.initBorrowed` to obtain a client borrowing its parent's state.
+
 ## Migrating from the prototype
 
 The 0.1.0 compatibility exports remain: `TableClient`,
 `TableServiceClient`, `TableEntity`, and the raw `getEntity`, `createEntity`,
-and `deleteEntity` calls keep their signatures. New code should select one
-explicit constructor (`initWithToken`, `initWithSharedKey`, `initWithSasUrl`,
-or `initFromConnectionString`) rather than assembling an unauthenticated
+and `deleteEntity` calls keep their signatures. New code should select an
+explicit `ClientAuthentication` input for the canonical `init` rather than assembling an unauthenticated
 prototype client. Replace `TableEntity` with a comptime-checked struct and
 `addEntity`/`getEntityAs(T, ...)` when the schema is known. For runtime
 schemas, use owning `DynamicEntity`. Replace manual continuation handling with
@@ -350,8 +398,7 @@ conditional requests with `updateEntity(..., .{ .if_match = etag })`.
 
 - Public types and generic type families use `PascalCase`; functions, methods,
   and fields use `lowerCamelCase`. Operation settings end in `Options`.
-- Authentication constructors are explicit: `initWithToken`,
-  `initWithSharedKey`, `initWithSasUrl`, and `initFromConnectionString`.
+- Clients expose one `init` with an explicit `ClientAuthentication` tagged input.
   Invalid credential combinations must not be representable.
 - Each network operation has a simple `operation` method and an
   `operationResult` variant. Zig error unions report local failures such as
@@ -418,6 +465,7 @@ allocating responses own an arena and must be released with `deinit`.
 |---|---|
 | `root.zig` | Public exports, compatibility aliases, and compile coverage |
 | `client.zig`, `service_client.zig` | Table- and account-scoped clients |
+| `client_configuration.zig` | Internal authentication normalization and construction-time ownership |
 | `pipeline.zig`, `auth.zig`, `request.zig` | Stable policy state, authentication, and shared request plumbing |
 | `connection_string.zig`, `sas.zig` | Connection strings and SAS |
 | `entity.zig`, `entity_codec.zig`, `edm.zig` | Entity models, typed codec, and EDM values |
