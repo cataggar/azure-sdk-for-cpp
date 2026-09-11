@@ -17,7 +17,8 @@ bootstrap_fail() {
 }
 
 bootstrap_tool() {
-  (cd "$ROOT" && zig run eng/package_bootstrap_tool.zig -- "$@")
+  # Keep imported registry state local to this worktree, not Zig run's shared cache.
+  (cd "$ROOT" && zig run --cache-dir "$ROOT/.zig-cache/release-tool-local" eng/package_bootstrap_tool.zig -- "$@")
 }
 
 bootstrap_sha256() {
@@ -127,9 +128,9 @@ bootstrap_source() {
   bootstrap_git archive --format=tar "$commit" >"$BOOTSTRAP_WORK/source.tar"
   mkdir "$BOOTSTRAP_WORK/tree"
   tar -xf "$BOOTSTRAP_WORK/source.tar" -C "$BOOTSTRAP_WORK/tree"
-  (cd "$ROOT" && zig run eng/package_branch_tool.zig -- validate-tree "$package" "$BOOTSTRAP_WORK/tree")
-  (cd "$ROOT" && zig run eng/candidate_manifest_tool.zig -- validate "$BOOTSTRAP_WORK/tree")
-  actual_tag="$(cd "$ROOT" && zig run eng/package_branch_tool.zig -- tag "$package" "$BOOTSTRAP_WORK/tree")"
+  (cd "$ROOT" && zig run --cache-dir "$ROOT/.zig-cache/release-tool-local" eng/package_branch_tool.zig -- validate-tree "$package" "$BOOTSTRAP_WORK/tree")
+  (cd "$ROOT" && zig run --cache-dir "$ROOT/.zig-cache/release-tool-local" eng/candidate_manifest_tool.zig -- validate "$BOOTSTRAP_WORK/tree")
+  actual_tag="$(cd "$ROOT" && zig run --cache-dir "$ROOT/.zig-cache/release-tool-local" eng/package_branch_tool.zig -- tag "$package" "$BOOTSTRAP_WORK/tree")"
   [[ "$actual_tag" == "$tag" ]] || bootstrap_fail "template manifest does not match its release tag"
 }
 

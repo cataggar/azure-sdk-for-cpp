@@ -98,6 +98,70 @@ expect_failure() {
 refs() { git --git-dir="$REMOTE" for-each-ref --format='%(objectname) %(refname)' | sort; }
 refs >"$WORK/before"
 
+# Exercise the actual wrappers with different registries and the same global cache.
+CACHE_TOOLING="$WORK/tooling-other"
+mkdir "$CACHE_TOOLING"
+cp -R "$TOOLING/eng" "$TOOLING/scripts" "$CACHE_TOOLING/"
+cp "$TOOLING/build.zig" "$TOOLING/.gitignore" "$CACHE_TOOLING/"
+sed -e 's/core_symcrypt/core_fixture/g' \
+  -e 's/source-check -Dsource_only=true/source-check -Dsource_only=true -Dfixture_second=true/g' \
+  "$TOOLING/eng/packages.zig" >"$CACHE_TOOLING/eng/packages.zig"
+sed 's/core_symcrypt/core_fixture/g' \
+  "$TOOLING/eng/package_history_map.zig" >"$CACHE_TOOLING/eng/package_history_map.zig"
+git init --quiet "$CACHE_TOOLING"
+git -C "$CACHE_TOOLING" add -f eng scripts build.zig .gitignore
+git -C "$CACHE_TOOLING" commit --quiet -m "Distinct offline tooling metadata"
+cat >"$WORK/cache-bootstrap.sh" <<'EOF'
+set -euo pipefail
+ROOT="$1"
+shift
+source "$ROOT/scripts/lib/package-bootstrap.sh"
+bootstrap_tool "$@"
+EOF
+cached_release() {
+  local root="$1"
+  shift
+  env ZIG_GLOBAL_CACHE_DIR="$WORK/shared-global-cache" \
+    ZIG_LOCAL_CACHE_DIR="$WORK/ambient-local-cache" \
+    bash "$root/scripts/package-branch-release.sh" render-ci "$@" "$WORK/cache-ci.yml"
+}
+cached_bootstrap() {
+  local root="$1"
+  shift
+  env ZIG_GLOBAL_CACHE_DIR="$WORK/shared-global-cache" \
+    ZIG_LOCAL_CACHE_DIR="$WORK/ambient-local-cache" \
+    bash "$WORK/cache-bootstrap.sh" "$root" target "$@" azure_sdk_testing "$TAG" "$COMMIT"
+}
+for cache_root in "$TOOLING" "$CACHE_TOOLING" "$TOOLING" "$CACHE_TOOLING"; do
+  if [[ "$cache_root" == "$TOOLING" ]]; then
+    cache_package=azure_sdk_core_symcrypt
+    cache_branch=refs/heads/sdk/core_symcrypt
+    cache_test='        run: zig build source-check -Dsource_only=true'
+  else
+    cache_package=azure_sdk_core_fixture
+    cache_branch=refs/heads/sdk/core_fixture
+    cache_test='        run: zig build source-check -Dsource_only=true -Dfixture_second=true'
+  fi
+  cached_release "$cache_root" "$cache_package"
+  grep -Fx "$cache_test" "$WORK/cache-ci.yml" >/dev/null
+  [[ "$(cached_bootstrap "$cache_root" "$cache_package")" == "$cache_branch" ]]
+done
+[[ -d "$TOOLING/.zig-cache/release-tool-local" &&
+  -d "$CACHE_TOOLING/.zig-cache/release-tool-local" &&
+  -d "$WORK/shared-global-cache" && ! -e "$WORK/ambient-local-cache" ]] || {
+  echo "FAIL: wrappers must use root-local compilation caches and preserve the shared global cache" >&2
+  exit 1
+}
+printf 'PASS: both wrappers use current-root metadata across alternating roots with shared global cache\n'
+expect_failure "release wrapper rejects sibling-only metadata" UnknownPackage \
+  cached_release "$TOOLING" azure_sdk_core_fixture
+expect_failure "bootstrap wrapper rejects sibling-only metadata" UnknownPackage \
+  cached_bootstrap "$TOOLING" azure_sdk_core_fixture
+expect_failure "release wrapper rejects replaced metadata in second root" UnknownPackage \
+  cached_release "$CACHE_TOOLING" azure_sdk_core_symcrypt
+expect_failure "bootstrap wrapper rejects replaced metadata in second root" UnknownPackage \
+  cached_bootstrap "$CACHE_TOOLING" azure_sdk_core_symcrypt
+
 expect_failure "unregistered package" UnknownPackage run seal unknown --id wrong \
   --template-package azure_sdk_testing --template-tag "$TAG" --template-commit "$COMMIT"
 expect_failure "reconstructed package" PackageIsNotBranchNative run seal azure_sdk_core --id wrong \

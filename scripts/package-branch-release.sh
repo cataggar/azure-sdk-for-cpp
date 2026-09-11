@@ -13,7 +13,8 @@ EOF
 }
 
 branch_tool() {
-  (cd "$ROOT" && zig run eng/package_branch_tool.zig -- "$@")
+  # Keep imported registry state local to this worktree, not Zig run's shared cache.
+  (cd "$ROOT" && zig run --cache-dir "$ROOT/.zig-cache/release-tool-local" eng/package_branch_tool.zig -- "$@")
 }
 
 remote_tag_commit() {

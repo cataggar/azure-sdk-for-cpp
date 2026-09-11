@@ -2,6 +2,11 @@
 
 Release commands depend on source ownership in `eng/packages.zig`.
 
+The branch release and bootstrap wrappers use an explicit compilation cache at
+`.zig-cache/release-tool-local` in their shared-tooling checkout. This prevents
+`zig run` from reusing a sibling worktree's imported registry metadata while
+keeping Zig's global standard-library cache shared; no shared-cache purge is needed.
+
 ## Core-family releases
 
 `azure_sdk_core`, `azure_sdk_core_symcrypt`, `azure_sdk_amqp`, and
