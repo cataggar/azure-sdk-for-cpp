@@ -43,15 +43,17 @@ pub const TraceContext = struct {
         return result;
     }
 
-    /// Conservative 512-byte/32-member limit; rejects duplicate keys.
+    /// Conservative 512-byte/32-nonempty-member limit; rejects duplicate keys.
+    /// Empty/OWS members are ignored, including an entirely empty field.
     pub fn validTracestate(state: []const u8) bool {
-        if (state.len == 0 or state.len > 512) return false;
+        if (state.len > 512) return false;
         var keys: [32][]const u8 = undefined;
         var count: usize = 0;
         var members = std.mem.splitScalar(u8, state, ',');
         while (members.next()) |raw| {
-            if (count == keys.len) return false;
             const member = std.mem.trim(u8, raw, " \t");
+            if (member.len == 0) continue;
+            if (count == keys.len) return false;
             const equal = std.mem.indexOfScalar(u8, member, '=') orelse return false;
             const key = member[0..equal];
             const value = member[equal + 1 ..];
@@ -116,8 +118,12 @@ test "W3C strict IDs versions and tracestate" {
     }) |bad| try std.testing.expect(TraceContext.parseTraceparent(bad) == null);
     try std.testing.expect(TraceContext.parseTraceparent("01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-03-extra") != null);
     try std.testing.expect(TraceContext.validTracestate("vendor=abc, 1tenant@system=value"));
-    inline for (.{ "", "a=1,a=2", "A=1", "a=", "a=x=y", "a=x,", "a=x\n", "@x=y", "a@=x" }) |bad|
+    inline for (.{ "a=1,a=2", "A=1", "a=", "a=x=y", "a=x\n", "@x=y", "a@=x" }) |bad|
         try std.testing.expect(!TraceContext.validTracestate(bad));
+    inline for (.{ "", " ", "\t", " , \t, ", "a=x,", ",a=x", "a=x, ,other=value" }) |valid| {
+        try std.testing.expect(TraceContext.validTracestate(valid));
+        try std.testing.expectEqualStrings(valid, TraceContext.extract(good, valid).?.trace_state.?);
+    }
     try std.testing.expect(TraceContext.extract(good, "bad").?.trace_state == null);
     try std.testing.expect(TraceContext.extract(null, "a=x") == null);
     const too_long = "a=" ++ "x" ** 511;
@@ -127,4 +133,17 @@ test "W3C strict IDs versions and tracestate" {
     var writer: std.Io.Writer = .fixed(&members);
     for (0..33) |i| try writer.print("{s}k{d}=x", .{ if (i == 0) "" else ",", i });
     try std.testing.expect(!TraceContext.validTracestate(writer.buffered()));
+}
+
+test "W3C empty tracestate members do not consume member limits" {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    for (0..32) |i| try writer.print(" ,k{d}=v,", .{i});
+    try writer.writeAll(" \t,");
+    try std.testing.expect(TraceContext.validTracestate(writer.buffered()));
+    try writer.writeAll("overflow=v");
+    try std.testing.expect(!TraceContext.validTracestate(writer.buffered()));
+    try std.testing.expect(!TraceContext.validTracestate("a=x, ,a=y"));
+    try std.testing.expect(!TraceContext.validTracestate("a=x,\r"));
+    try std.testing.expect(!TraceContext.validTracestate(" " ** 513));
 }

@@ -67,17 +67,36 @@ span's `getContext()` view must not outlive that span unless copied.
 
 The implementation uses W3C Trace Context Level 1: nonzero lowercase hex IDs,
 version-00 exact length and specified higher-version handling, sampled-bit
-propagation, and validated tracestate capped at 512 bytes/32 members. Malformed
+propagation, and validated tracestate capped at 512 bytes/32 nonempty members.
+Empty fields and empty/OWS list members are valid and ignored when counting
+members; valid field ordering and whitespace are preserved. Malformed
 parents become roots; invalid tracestate is dropped. Root sampling defaults to
 enabled **only after** configuring instrumentation. Unsampled parents propagate
 valid child IDs without queuing records.
 
 Generated headers are request-owned, restored on completion, and are not
-re-extracted as parents on retries or request reuse. Header-allocation failures
-do not replace service results. The provider's `propagation_errors` counter
-reports failures; an exceptional allocation failure while restoring headers
-after a downstream policy changed map capacity can drop the saved caller header
-pair, with all storage freed. The shared transport strips managed trace headers
+re-extracted as parents on retries or request reuse. Installation-allocation
+failures leave the caller's original entries intact and increment the provider's
+`propagation_errors` counter without replacing service results. Restoration
+itself does not allocate: removing the installed entries frees the actual 0/1/2
+slots needed by saved caller entries. If an original tracestate had invalid
+contents, dispatch uses a valid empty tracestate field, discarding the invalid
+contents while retaining its restoration slot. The exact original value,
+including invalid or empty values, is restored afterward.
+
+**Policy mutation contract:** policies may add, replace, and remove unrelated
+headers and replace managed trace-header values. If they remove managed trace
+entries or replace the header map, they must leave enough unused slots for all
+saved caller entries (reserving two is sufficient). They must not consume those
+restoration slots with unrelated additions. Keeping the managed entries is the
+simple allocation-free option; suppress tracing before dispatch when propagation
+is unwanted. Direct map mutation that destroys those slots is diagnosed as a
+programming-contract violation, not a successful restore or discarded caller
+context. Arbitrary removal plus saturation cannot preserve all unrelated
+mutations and originals under permanent allocation failure in a single hash map;
+supporting it would require a different header API/storage contract.
+
+The shared transport strips managed trace headers
 on cross-origin redirects; same-origin hops retain them. Uninstrumented,
 caller-managed headers retain existing transport behavior.
 

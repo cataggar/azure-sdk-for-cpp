@@ -50,6 +50,9 @@ pub const Request = struct {
     /// Per-call trace parent/suppression. HTTP cancellation still uses OpenOptions.
     context: @import("../context.zig").Context = .none,
     /// Managed by tracing during dispatch; controls cross-origin header stripping.
+    /// Policies replacing values or mutating unrelated headers are safe. Removing
+    /// managed entries/replacing the map requires retaining two restoration slots;
+    /// see tracing/README.md. Use context.tracing_suppressed before dispatch to opt out.
     tracing_headers_managed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, method: Method, request_url: []const u8) Request {

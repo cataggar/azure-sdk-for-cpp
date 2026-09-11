@@ -6,7 +6,6 @@ const Request = @import("../http/transport.zig").Request;
 pub const Scope = struct {
     request: *Request,
     span: ?*tracing.Span = null,
-    provider: ?*tracing.TracerProvider = null,
     headers: ?HeaderGuard = null,
     previous_suppressed: bool = false,
 
@@ -14,7 +13,6 @@ pub const Scope = struct {
         var result: Scope = .{ .request = request };
         if (request.context.tracing_suppressed) return result;
         const config = options orelse return result;
-        result.provider = config.provider;
         const parent = request.context.traceContext() orelse config.parent_context orelse
             tracing.TraceContext.extract(request.getHeader("traceparent"), request.getHeader("tracestate"));
         const tracer = config.provider.getTracer(config.scope_name, config.scope_version);
@@ -54,7 +52,7 @@ pub const Scope = struct {
 
     pub fn end(self: *Scope) void {
         if (self.headers) |*headers| {
-            if (!headers.restore()) self.provider.?.recordPropagationError();
+            headers.restore();
         }
         if (self.span) |span| {
             self.request.context.tracing_suppressed = self.previous_suppressed;
@@ -82,6 +80,8 @@ const Header = struct { key: []const u8, value: []const u8 };
 
 /// Moves caller-owned entries aside, installs request-owned copies, then restores
 /// the originals. No saved slice points at a stack traceparent buffer.
+/// Policies must retain restoration slots: replacing values and mutating unrelated
+/// headers is safe; deleting managed entries and filling their slots is not.
 const HeaderGuard = struct {
     request: *Request,
     parent: ?Header,
@@ -96,11 +96,19 @@ const HeaderGuard = struct {
             .state = take(request, "tracestate"),
             .previous_managed = request.tracing_headers_managed,
         };
-        errdefer std.debug.assert(self.restore());
+        errdefer self.restore();
         const parent = context.formatTraceparent();
         try request.setHeader("traceparent", &parent);
-        if (context.trace_state) |state| {
-            if (tracing.TraceContext.validTracestate(state)) try request.setHeader("tracestate", state);
+        const state = if (context.trace_state) |value|
+            if (tracing.TraceContext.validTracestate(value)) value else null
+        else
+            null;
+        if (state) |value| {
+            try request.setHeader("tracestate", value);
+        } else if (self.state != null) {
+            // W3C permits an empty tracestate. Discard invalid contents while
+            // retaining the map slot needed to restore the caller's entry.
+            try request.setHeader("tracestate", "");
         }
         request.tracing_headers_managed = true;
         return self;
@@ -124,22 +132,19 @@ const HeaderGuard = struct {
         }
     }
 
-    fn restore(self: *HeaderGuard) bool {
+    fn restore(self: *HeaderGuard) void {
         free(self.request, take(self.request, "traceparent"));
         free(self.request, take(self.request, "tracestate"));
         self.request.tracing_headers_managed = self.previous_managed;
-        // Downstream policies may have filled capacity after removing our headers.
-        self.request.headers.ensureUnusedCapacity(2) catch {
-            free(self.request, self.parent);
-            free(self.request, self.state);
-            self.parent = null;
-            self.state = null;
-            return false;
-        };
+        const saved_count: u32 = @as(u32, @intFromBool(self.parent != null)) +
+            @intFromBool(self.state != null);
+        // Removing our entries supplies the actual 0/1/2 restoration slots.
+        // Allocating here could turn a successful request into lost caller state.
+        if (self.request.headers.unmanaged.available < saved_count)
+            @panic("HTTP policy consumed caller trace-header restoration slots");
         if (self.parent) |h| self.request.headers.putAssumeCapacity(h.key, h.value);
         if (self.state) |h| self.request.headers.putAssumeCapacity(h.key, h.value);
         self.parent = null;
         self.state = null;
-        return true;
     }
 };

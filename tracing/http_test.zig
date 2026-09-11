@@ -231,30 +231,167 @@ test "tracing pipeline open ends at headers without owning response operation ca
 }
 
 test "tracing pipeline header allocation failures roll back without failing service operation" {
-    for (0..8) |offset| {
-        var crypto = crypto_mod.StdCryptoProvider.init(std.testing.io);
-        var mock = http.MockTransport.init(allocator, 200, "");
-        defer mock.deinit();
-        const runtime = http.HttpRuntime.init(mock.asTransport(), crypto.asProvider());
-        var probe: Probe = .{};
-        var provider = try Provider.init(allocator, std.testing.io, runtime.crypto, &probe.exporter, .{});
-        defer provider.deinit() catch unreachable;
-        var pipeline = pipelineFor(runtime, &provider, &.{});
-        var failing = std.testing.FailingAllocator.init(allocator, .{});
-        var request = http.Request.init(failing.allocator(), .GET, "https://example.test");
-        defer request.deinit();
-        const original = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        try request.setHeader("traceparent", original);
-        try request.setHeader("tracestate", "vendor=value");
-        failing.fail_index = failing.alloc_index + offset;
-        var response = try pipeline.send(&request);
-        defer response.deinit();
-        try std.testing.expectEqual(@as(u16, 200), response.status_code);
-        try std.testing.expectEqualStrings(original, request.getHeader("traceparent").?);
-        try std.testing.expectEqualStrings("vendor=value", request.getHeader("tracestate").?);
-        if (failing.has_induced_failure)
-            try std.testing.expect(provider.stats().propagation_errors > 0);
-        try provider.shutdown(1000);
+    for ([_][]const u8{ "vendor=value", "", "invalid=has=equals" }) |original_state| {
+        for (0..8) |offset| {
+            var crypto = crypto_mod.StdCryptoProvider.init(std.testing.io);
+            var mock = http.MockTransport.init(allocator, 200, "");
+            defer mock.deinit();
+            const runtime = http.HttpRuntime.init(mock.asTransport(), crypto.asProvider());
+            var probe: Probe = .{};
+            var provider = try Provider.init(allocator, std.testing.io, runtime.crypto, &probe.exporter, .{});
+            defer provider.deinit() catch unreachable;
+            var pipeline = pipelineFor(runtime, &provider, &.{});
+            var failing = std.testing.FailingAllocator.init(allocator, .{});
+            var request = http.Request.init(failing.allocator(), .GET, "https://example.test");
+            defer request.deinit();
+            const original = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+            try request.setHeader("traceparent", original);
+            try request.setHeader("tracestate", original_state);
+            failing.fail_index = failing.alloc_index + offset;
+            var response = try pipeline.send(&request);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status_code);
+            try std.testing.expectEqualStrings(original, request.getHeader("traceparent").?);
+            try std.testing.expectEqualStrings(original_state, request.getHeader("tracestate").?);
+            if (failing.has_induced_failure)
+                try std.testing.expect(provider.stats().propagation_errors > 0);
+            try provider.shutdown(1000);
+        }
+    }
+}
+
+test "tracing restoration at the map load limit never allocates or loses saved caller headers" {
+    const original_parent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    const Case = struct { parent: bool, state: ?[]const u8, wire_state: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .parent = false, .state = null, .wire_state = null },
+        .{ .parent = true, .state = null, .wire_state = null },
+        .{ .parent = false, .state = "vendor=value", .wire_state = "" },
+        .{ .parent = true, .state = "vendor=value", .wire_state = "vendor=value" },
+        .{ .parent = true, .state = "invalid=has=equals", .wire_state = "" },
+        .{ .parent = true, .state = "", .wire_state = "" },
+        .{ .parent = true, .state = " \t", .wire_state = " \t" },
+        .{ .parent = true, .state = "vendor=value,", .wire_state = "vendor=value," },
+        .{ .parent = true, .state = "vendor=value, ,other=value", .wire_state = "vendor=value, ,other=value" },
+        .{ .parent = true, .state = ", , ", .wire_state = ", , " },
+    };
+    const Mutation = enum { unrelated, replace_managed, remove_with_room };
+    const Policy = struct {
+        failing: *std.testing.FailingAllocator,
+        mutation: Mutation,
+        saved_count: u32,
+        additions: usize = 0,
+        return_count: u32 = 0,
+        installed_count: u32 = 0,
+        blocked_at: usize = 0,
+        return_error: bool = false,
+        policy: http.HttpPolicy = .{ .processFn = process },
+
+        fn remove(request: *http.Request, key: []const u8) void {
+            if (request.headers.fetchRemove(key)) |removed| {
+                request.allocator.free(removed.key);
+                request.allocator.free(removed.value);
+            }
+        }
+
+        fn process(policy: *http.HttpPolicy, request: *http.Request, _: []*http.HttpPolicy, runtime: http.HttpRuntime) !http.Response {
+            const self: *@This() = @fieldParentPtr("policy", policy);
+            try request.setHeader("x-change", "after");
+            remove(request, "x-remove");
+            switch (self.mutation) {
+                .unrelated => {},
+                .replace_managed => {
+                    try request.setHeader("traceparent", "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01");
+                    if (request.getHeader("tracestate") != null)
+                        try request.setHeader("tracestate", "policy=value");
+                },
+                .remove_with_room => {
+                    remove(request, "traceparent");
+                    remove(request, "tracestate");
+                },
+            }
+            const reserve = if (self.mutation == .remove_with_room) self.saved_count else 0;
+            while (request.headers.unmanaged.available > reserve) {
+                var name: [32]u8 = undefined;
+                try request.setHeader(std.fmt.bufPrint(&name, "x-added-{d}", .{self.additions}) catch unreachable, "retained");
+                self.additions += 1;
+            }
+            self.return_count = request.headers.count();
+            self.installed_count = @as(u32, @intFromBool(request.getHeader("traceparent") != null)) +
+                @intFromBool(request.getHeader("tracestate") != null);
+            self.blocked_at = self.failing.alloc_index;
+            self.failing.fail_index = self.blocked_at;
+            if (self.return_error) return error.TestPolicyFailure;
+            return runtime.transport.send(request);
+        }
+    };
+    for (cases) |case| {
+        inline for (.{ Mutation.unrelated, Mutation.replace_managed, Mutation.remove_with_room }) |mutation| {
+            var crypto = crypto_mod.StdCryptoProvider.init(std.testing.io);
+            var mock = http.MockTransport.init(allocator, 200, "");
+            defer mock.deinit();
+            const runtime = http.HttpRuntime.init(mock.asTransport(), crypto.asProvider());
+            var probe: Probe = .{};
+            var provider = try Provider.init(allocator, std.testing.io, runtime.crypto, &probe.exporter, .{});
+            defer provider.deinit() catch unreachable;
+            var failing = std.testing.FailingAllocator.init(allocator, .{});
+            var request = http.Request.init(failing.allocator(), .GET, "https://example.test");
+            defer request.deinit();
+            if (case.parent) try request.setHeader("TraceParent", original_parent);
+            if (case.state) |state| try request.setHeader("TraceState", state);
+            try request.setHeader("x-change", "before");
+            try request.setHeader("x-remove", "remove me");
+            var policy: Policy = .{
+                .failing = &failing,
+                .mutation = mutation,
+                .saved_count = @as(u32, @intFromBool(case.parent)) + @intFromBool(case.state != null),
+            };
+            var policies = [_]*http.HttpPolicy{&policy.policy};
+            var pipeline = pipelineFor(runtime, &provider, &policies);
+            // Reuse the same request, including a service/policy error return.
+            for (0..2) |call| {
+                failing.fail_index = std.math.maxInt(usize);
+                policy.return_error = call == 1;
+                if (policy.return_error) {
+                    try std.testing.expectError(error.TestPolicyFailure, pipeline.send(&request));
+                } else {
+                    var response = try pipeline.send(&request);
+                    defer response.deinit();
+                    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+                    if (mutation == .unrelated) {
+                        if (case.wire_state) |state|
+                            try std.testing.expectEqualStrings(state, mock.last_headers.get("tracestate").?)
+                        else
+                            try std.testing.expect(mock.last_headers.get("tracestate") == null);
+                    }
+                }
+                try std.testing.expect(!failing.has_induced_failure);
+                try std.testing.expectEqual(policy.blocked_at, failing.alloc_index);
+                try std.testing.expectEqual(policy.return_count - policy.installed_count + policy.saved_count, request.headers.count());
+                if (case.parent)
+                    try std.testing.expectEqualStrings(original_parent, request.getHeader("traceparent").?)
+                else
+                    try std.testing.expect(request.getHeader("traceparent") == null);
+                if (case.state) |state|
+                    try std.testing.expectEqualStrings(state, request.getHeader("tracestate").?)
+                else
+                    try std.testing.expect(request.getHeader("tracestate") == null);
+                try std.testing.expectEqualStrings("after", request.getHeader("x-change").?);
+                try std.testing.expect(request.getHeader("x-remove") == null);
+                for (0..policy.additions) |i| {
+                    var name: [32]u8 = undefined;
+                    const key = std.fmt.bufPrint(&name, "x-added-{d}", .{i}) catch unreachable;
+                    try std.testing.expectEqualStrings("retained", request.getHeader(key).?);
+                }
+            }
+            try std.testing.expectEqual(@as(u64, 0), provider.stats().propagation_errors);
+            try provider.shutdown(1000);
+            try std.testing.expectEqual(@as(usize, 2), probe.count);
+            if (case.parent) {
+                for (probe.parents[0..2]) |parent|
+                    try std.testing.expectEqualStrings("b7ad6b7169203331", &parent.?);
+            }
+        }
     }
 }
 
