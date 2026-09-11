@@ -2,6 +2,11 @@
 
 Release commands depend on source ownership in `eng/packages.zig`.
 
+The branch release and bootstrap wrappers use an explicit compilation cache at
+`.zig-cache/release-tool-local` in their shared-tooling checkout. This prevents
+`zig run` from reusing a sibling worktree's imported registry metadata while
+keeping Zig's global standard-library cache shared; no shared-cache purge is needed.
+
 ## Core-family releases
 
 `azure_sdk_core`, `azure_sdk_core_symcrypt`, `azure_sdk_amqp`, and
@@ -69,6 +74,11 @@ pins before finalizing `azure_sdk_kusto`; its manifest also pins the external
 `serde` dependency.
 
 ## Completed one-time reset
+
+New branch-native packages do **not** re-run or extend that completed reset.
+Use the [sealed branch-native bootstrap](package-bootstrap.md) to create one
+registered, explicitly branch-native, expected-absent package branch from a
+reviewed existing package release. The seed is not a release of the new package.
 
 The 2026-07-24 package reset established 18 non-Core package branches and
 their `v0.1.0` tags from history-preserving candidate commits. Seventeen

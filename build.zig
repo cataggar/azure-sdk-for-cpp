@@ -137,6 +137,26 @@ fn addPackageToolSteps(b: *std.Build, test_step: *std.Build.Step) void {
     });
     test_step.dependOn(&b.addRunArtifact(branch_tool_tests).step);
 
+    const bootstrap_tool_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("eng/package_bootstrap_tool.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const bootstrap_unit_run = b.addRunArtifact(bootstrap_tool_tests);
+    const bootstrap_fixtures = b.addSystemCommand(&.{
+        "bash", "eng/fixtures/package_bootstrap/test.sh",
+    });
+    bootstrap_fixtures.setCwd(b.path("."));
+    bootstrap_fixtures.step.dependOn(&bootstrap_unit_run.step);
+    const bootstrap_test_step = b.step(
+        "package-bootstrap-test",
+        "Test sealed branch-native bootstrap against offline fixture repositories",
+    );
+    bootstrap_test_step.dependOn(&bootstrap_fixtures.step);
+    test_step.dependOn(&bootstrap_fixtures.step);
+
     const candidate_manifest_tool_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("eng/candidate_manifest_tool.zig"),
