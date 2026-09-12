@@ -10,8 +10,8 @@ pub const ShareServiceClientOptions = struct {
 /// Account-scoped Azure Files client.
 ///
 /// The endpoint, option strings, pipeline policy storage, and the backend
-/// contexts borrowed by `pipeline.runtime` must outlive this client and every
-/// client derived from it.
+/// contexts borrowed by `pipeline.runtime`, and any instrumentation provider
+/// and configuration strings must outlive this client and its descendants.
 pub const ShareServiceClient = struct {
     endpoint: []const u8,
     api_version: []const u8,
@@ -48,8 +48,8 @@ pub const ShareClientOptions = struct {
 /// Share-scoped Azure Files client.
 ///
 /// The endpoint, share name, option strings, pipeline policy storage, and the
-/// backend contexts borrowed by `pipeline.runtime` must outlive this client
-/// and every client derived from it.
+/// backend contexts borrowed by `pipeline.runtime`, and any instrumentation
+/// provider/configuration strings must outlive this client and its descendants.
 pub const ShareClient = struct {
     endpoint: []const u8,
     share_name: []const u8,
@@ -146,8 +146,8 @@ pub const ShareDirectoryClientOptions = struct {
 /// Directory-scoped Azure Files client.
 ///
 /// The endpoint, names, option strings, pipeline policy storage, and the
-/// backend contexts borrowed by `pipeline.runtime` must outlive this client
-/// and every client derived from it.
+/// backend contexts borrowed by `pipeline.runtime`, and any instrumentation
+/// provider/configuration strings must outlive this client and its descendants.
 pub const ShareDirectoryClient = struct {
     endpoint: []const u8,
     share_name: []const u8,
@@ -249,8 +249,8 @@ pub const ShareFileClientOptions = struct {
 /// File-scoped Azure Files client.
 ///
 /// The endpoint, names, option strings, pipeline policy storage, and the
-/// transport and crypto backend contexts borrowed by `pipeline.runtime` must
-/// outlive this client.
+/// transport/crypto contexts borrowed by `pipeline.runtime`, and any
+/// instrumentation provider/configuration strings must outlive this client.
 pub const ShareFileClient = struct {
     endpoint: []const u8,
     share_name: []const u8,
@@ -472,5 +472,120 @@ test "constructors and derived clients preserve the selected runtime providers" 
     inline for (.{ direct_share.pipeline, direct_directory.pipeline, direct_file.pipeline }) |client_pipeline| {
         try std.testing.expectEqual(runtime.transport.context, client_pipeline.runtime.transport.context);
         try std.testing.expectEqual(runtime.crypto.context, client_pipeline.runtime.crypto.context);
+    }
+}
+
+const TracingProbe = struct {
+    exporter: core.tracing.SpanExporter = .{ .exportFn = &exportBatch },
+    span_ids: [8][16]u8 = undefined,
+    dispatched: usize = 0,
+    exported: usize = 0,
+
+    fn capture(self: *TracingProbe, transport: *core.http.MockTransport, enabled: bool) !void {
+        const traceparent = transport.last_headers.get("traceparent");
+        const tracestate = transport.last_headers.get("tracestate");
+        if (enabled) {
+            const context = core.tracing.TraceContext.parseTraceparent(traceparent orelse return error.MissingTraceparent) orelse
+                return error.InvalidTraceparent;
+            try std.testing.expectEqualStrings("0af7651916cd43dd8448eb211c80319c", &context.trace_id);
+            try std.testing.expectEqualStrings("vendor=value", tracestate orelse "");
+            try std.testing.expect(!std.mem.eql(u8, "b7ad6b7169203331", &context.span_id));
+            for (self.span_ids[0..self.dispatched]) |previous|
+                try std.testing.expect(!std.mem.eql(u8, &previous, &context.span_id));
+            self.span_ids[self.dispatched] = context.span_id;
+        } else {
+            try std.testing.expect(traceparent == null and tracestate == null);
+        }
+        self.dispatched += 1;
+    }
+
+    fn exportBatch(exporter: *core.tracing.SpanExporter, batch: []const core.tracing.SpanData, _: core.tracing.ExportContext) !void {
+        const self: *TracingProbe = @fieldParentPtr("exporter", exporter);
+        for (batch) |span| {
+            try std.testing.expect(self.exported < self.dispatched);
+            try std.testing.expectEqualStrings("caller.scope", span.scope_name);
+            try std.testing.expectEqualStrings("caller-version", span.scope_version);
+            try std.testing.expectEqual(core.tracing.SpanKind.client, span.kind);
+            try std.testing.expectEqualStrings("b7ad6b7169203331", &span.parent_span_id.?);
+            try std.testing.expectEqualStrings("0af7651916cd43dd8448eb211c80319c", &span.context.trace_id);
+            try std.testing.expectEqualStrings("vendor=value", span.context.trace_state orelse "");
+            try std.testing.expectEqualStrings(&self.span_ids[self.exported], &span.context.span_id);
+            var namespace_seen = false;
+            for (span.attributes) |attribute| {
+                if (!std.mem.eql(u8, "az.namespace", attribute.key)) continue;
+                try std.testing.expect(attribute.value == .string);
+                try std.testing.expectEqualStrings("Caller.Namespace", attribute.value.string);
+                namespace_seen = true;
+            }
+            try std.testing.expect(namespace_seen);
+            self.exported += 1;
+        }
+    }
+};
+
+test "caller tracing is inherited by every Shares constructor and descendant, or stays disabled" {
+    for ([_]bool{ true, false }) |enabled| {
+        const allocator = std.testing.allocator;
+        var transport = core.http.MockTransport.init(allocator, 200, "file contents");
+        defer transport.deinit();
+        var crypto = core.crypto.StdCryptoProvider.init(std.testing.io);
+        const runtime = core.http.HttpRuntime.init(transport.asTransport(), crypto.asProvider());
+        var probe = TracingProbe{};
+        var provider = try core.tracing.ExportingTracerProvider.init(
+            allocator,
+            std.testing.io,
+            runtime.crypto,
+            &probe.exporter,
+            .{},
+        );
+        defer provider.deinit() catch unreachable;
+        var pipeline = core.http.HttpPipeline.init(runtime, &.{});
+        var parent = core.tracing.TraceContext.parseTraceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01").?;
+        parent.trace_state = "vendor=value";
+        if (enabled) pipeline.setInstrumentation(.{
+            .provider = provider.asProvider(),
+            .scope_name = "caller.scope",
+            .scope_version = "caller-version",
+            .namespace = "Caller.Namespace",
+            .parent_context = parent,
+        });
+        var service = ShareServiceClient.init(pipeline, "https://account.file.core.windows.net", .{});
+        var share = service.getShareClient("share");
+        var directory = share.getDirectoryClient("directory");
+        var file = directory.getFileClient("file");
+        var direct_share = ShareClient.init(pipeline, service.endpoint, "share", .{});
+        var direct_directory = ShareDirectoryClient.init(pipeline, service.endpoint, "share", "directory", .{});
+        var direct_file = ShareFileClient.init(pipeline, service.endpoint, "share", "directory", "file", .{});
+        pipeline.setInstrumentation(null);
+        service.pipeline.setInstrumentation(null);
+
+        try share.create(allocator);
+        try probe.capture(&transport, enabled);
+        share.pipeline.setInstrumentation(null);
+        try directory.create(allocator);
+        try probe.capture(&transport, enabled);
+        directory.pipeline.setInstrumentation(null);
+        try file.create(allocator, 13);
+        try probe.capture(&transport, enabled);
+        try direct_share.deleteShare(allocator);
+        try probe.capture(&transport, enabled);
+        try direct_directory.deleteDirectory(allocator);
+        try probe.capture(&transport, enabled);
+        const content = try direct_file.download(allocator);
+        defer allocator.free(content);
+        try std.testing.expectEqualStrings("file contents", content);
+        try probe.capture(&transport, enabled);
+
+        const expected: usize = if (enabled) 6 else 0;
+        try std.testing.expectEqual(@as(usize, 6), transport.call_count);
+        try std.testing.expectEqual(@as(usize, 0), probe.exported);
+        try std.testing.expectEqual(expected, provider.stats().queued_spans);
+        try std.testing.expectEqual(@as(usize, 0), provider.stats().active_spans);
+        try std.testing.expect(!provider.closed);
+        try provider.forceFlush(1000);
+        try std.testing.expectEqual(expected, probe.exported);
+        try std.testing.expectEqual(@as(u64, expected), provider.stats().started);
+        try std.testing.expectEqual(@as(u64, expected), provider.stats().ended);
+        try provider.shutdown(1000);
     }
 }
