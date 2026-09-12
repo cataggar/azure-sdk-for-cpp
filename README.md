@@ -7,14 +7,55 @@ Azure Cosmos DB clients:
 - `ContainerClient`
 
 Release branch: `sdk/data_cosmos`. The package depends on
-`azure_sdk_core` and `serde`. Version `0.2.0` uses Core's canonical
-`HttpRuntime`.
+`azure_sdk_core` and `serde`. Version `0.3.0` uses Core `0.4.0` and its
+canonical `HttpRuntime`.
 
 Construct `CosmosClient` with an allocator, borrowed token credential, and
 `core.http.HttpRuntime`, then call `deinit`. Database and container clients
 borrow the parent client's heap-stable pipeline state and must not outlive it.
 The runtime's transport and crypto backend contexts are also borrowed.
 Authenticated endpoints must use HTTPS.
+
+## Opt-in tracing
+
+Pass Core's full instrumentation configuration in the existing client options:
+
+```zig
+var client = try cosmos.CosmosClient.init(
+    allocator,
+    endpoint,
+    credential,
+    runtime,
+    .{ .instrumentation = .{
+        .provider = provider.asProvider(),
+        .scope_name = "azure_sdk_data_cosmos",
+        .scope_version = "0.3.0",
+        .namespace = "Microsoft.DocumentDB",
+        .parent_context = parent, // Optional core.tracing.TraceContext.
+    } },
+);
+defer client.deinit();
+```
+
+`instrumentation` defaults to `null`: no automatic spans or trace headers.
+The example's scope is not a default; an explicit caller scope, version,
+namespace and default parent are preserved. Database and container clients
+inherit the configured pipeline. This does not change OAuth scopes, raw
+document ownership, opaque partition/continuation values, or create replay
+classification.
+
+The application owns the provider and exporter/sink. Keep their addresses
+stable and their backing resources alive until every client, descendant and
+operation has finished. Nonstatic scope/version/namespace strings and parent
+tracestate are also borrowed for that lifetime. Clients never drain, flush,
+shut down or deinitialize the provider. For Core's
+[`ExportingTracerProvider`](https://github.com/cataggar/azure-sdk-for-zig/blob/azure_sdk_core/v0.4.0/tracing/README.md),
+the application explicitly calls bounded `drain(timeout_ms)`,
+`forceFlush(timeout_ms)` and `shutdown(timeout_ms)` as appropriate. There is no
+hidden export worker or network exporter. Core streaming spans end at response
+headers, not after body consumption; SDK result parsing is outside the HTTP
+span. Per-call context parameters remain deferred to
+[#465](https://github.com/cataggar/azure-sdk-for-zig/issues/465).
 
 ## Driver boundary decision (#145)
 
