@@ -1,6 +1,6 @@
 //! Azure SDK testing helpers for recording and playback.
 //!
-//! `PlaybackTransport` and `RecordingTransport` expose copyable Core 0.3
+//! `PlaybackTransport` and `RecordingTransport` expose copyable Core 0.4
 //! transport descriptors whose opaque contexts borrow the transport values.
 //! The values and any wrapped backend contexts must outlive every descriptor
 //! copy and open operation. Playback is caller-serialized. Recording attempt
@@ -2027,7 +2027,7 @@ fn matchRequest(
         if (!std.mem.eql(u8, expected, body.?)) return error.BodyMismatch;
     }
     for (exchange.request_headers) |expected| {
-        const actual = getHeader(&request.headers, expected.name) orelse
+        const actual = request.getHeader(expected.name) orelse
             return error.HeaderMismatch;
         if (!try headerValueMatches(
             request.allocator,
@@ -2079,8 +2079,8 @@ fn validateRequestFraming(
     request: *const core.http.Request,
     options: core.http.OpenOptions,
 ) !void {
-    const content_length = getHeader(&request.headers, "Content-Length");
-    const transfer_encoding = getHeader(&request.headers, "Transfer-Encoding");
+    const content_length = request.getHeader("Content-Length");
+    const transfer_encoding = request.getHeader("Transfer-Encoding");
     const framing: union(enum) {
         none,
         content_length: u64,
@@ -2178,7 +2178,7 @@ fn checkCancelled(token: ?*const core.http.CancellationToken) !void {
 
 fn cloneRequestHeaders(
     allocator: std.mem.Allocator,
-    headers: *const std.StringHashMap([]const u8),
+    headers: *const core.http.RequestHeaders,
 ) ![]HeaderPair {
     const result = try allocator.alloc(HeaderPair, headers.count());
     var initialized: usize = 0;
@@ -2202,6 +2202,88 @@ fn cloneRequestHeaders(
     return result;
 }
 
+fn requestHeaderSnapshotFixture(allocator: std.mem.Allocator) !void {
+    const expected = [_]HeaderPair{
+        .{ .name = "X-Snapshot", .value = "ordinary" },
+        .{ .name = "TraceParent", .value = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01" },
+        .{ .name = "TrAcEsTaTe", .value = "vendor=opaque" },
+    };
+    var pending = blk: {
+        const source_allocator = std.testing.allocator;
+        const url = try source_allocator.dupe(u8, "https://example.test/snapshot");
+        defer source_allocator.free(url);
+        var request = core.http.Request.init(source_allocator, .POST, url);
+        defer request.deinit();
+        for (expected) |header| try request.setHeader(header.name, header.value);
+        try std.testing.expectEqual(@as(usize, 3), request.headers.count());
+        var iterator = request.headers.iterator();
+        var count: usize = 0;
+        while (iterator.next() != null) count += 1;
+        try std.testing.expectEqual(@as(usize, 3), count);
+        var body = "payload".*;
+        const snapshot = try PendingRequest.init(allocator, &request, &body);
+        @memset(&body, 'x');
+        request.headers.clearAndFree();
+        break :blk snapshot;
+    };
+    defer pending.deinit(allocator);
+    try std.testing.expectEqualStrings("https://example.test/snapshot", pending.url);
+    try std.testing.expectEqualStrings("payload", pending.body.?);
+    try std.testing.expectEqual(expected.len, pending.headers.len);
+    for (expected) |wanted| {
+        var found = false;
+        for (pending.headers) |header| {
+            if (!std.mem.eql(u8, header.name, wanted.name)) continue;
+            try std.testing.expectEqualStrings(wanted.value, header.value);
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "Core 0.4 request snapshots own ordinary and trace headers after source teardown" {
+    try requestHeaderSnapshotFixture(std.testing.allocator);
+}
+
+test "Core 0.4 request snapshot allocation failures release independently owned headers" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, requestHeaderSnapshotFixture, .{});
+}
+
+test "Core 0.4 request matching and framing remain case insensitive with trace slots" {
+    var request = core.http.Request.init(std.testing.allocator, .POST, "https://example.test/headers");
+    defer request.deinit();
+    try request.setHeader("tRaCePaReNt", "parent");
+    try request.setHeader("TrAcEsTaTe", "vendor=state");
+    try request.setHeader("cOnTeNt-LeNgTh", "4");
+    request.body = "body";
+    const exchange = RecordedExchange{
+        .request_method = .POST,
+        .request_url = request.url,
+        .request_body = "body",
+        .request_headers = &.{
+            .{ .name = "TRACEPARENT", .value = "parent" },
+            .{ .name = "tracestate", .value = "vendor=state" },
+            .{ .name = "Content-Length", .value = "4" },
+        },
+    };
+    try matchRequest(exchange, &request, request.body);
+    try validateRequestFraming(&request, .{});
+    try request.setHeader("TRACEPARENT", "changed");
+    try std.testing.expectEqual(@as(usize, 3), request.headers.count());
+    try std.testing.expectError(error.HeaderMismatch, matchRequest(exchange, &request, request.body));
+    try request.setHeader("CoNtEnT-LeNgTh", "5");
+    try std.testing.expectError(error.ConflictingRequestFraming, validateRequestFraming(&request, .{}));
+    _ = request.removeHeader("CONTENT-LENGTH");
+    request.body = null;
+    var reader = std.Io.Reader.fixed("body");
+    try request.setHeader("tRaNsFeR-EnCoDiNg", "ChUnKeD");
+    const options = core.http.OpenOptions{ .body = core.http.StreamingRequestBody.chunked(&reader) };
+    try validateRequestFraming(&request, options);
+    try request.setHeader("content-length", "4");
+    try std.testing.expectError(error.ConflictingRequestFraming, validateRequestFraming(&request, options));
+}
+
 fn deinitHeaderPairs(
     allocator: std.mem.Allocator,
     headers: []const HeaderPair,
@@ -2213,18 +2295,6 @@ fn deinitHeaderPairs(
             allocator.free(template);
     }
     allocator.free(headers);
-}
-
-fn getHeader(
-    headers: *const std.StringHashMap([]const u8),
-    name: []const u8,
-) ?[]const u8 {
-    var iterator = headers.iterator();
-    while (iterator.next()) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name))
-            return entry.value_ptr.*;
-    }
-    return null;
 }
 
 fn putOwnedHeader(
