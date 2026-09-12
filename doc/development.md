@@ -9,15 +9,21 @@ Use Zig 0.16.0 or later.
 ```bash
 zig build
 zig build test --summary all
+zig build current-runtime-consumer-test --summary all
 zig build package-check --summary all
 zig build package-history-check --summary all
 zig fmt --check codegen/ eng/ build.zig
 ```
 
-`main` owns no package source, so root package tests run only the workspace
-tooling and a fixture consumer that pins `azure_sdk_core` by immutable commit
-and hash. The catalog and history checks still cover all 21 registered package
-identities.
+`main` owns no package source, so root tests run workspace tooling and fixture
+consumers that pin `azure_sdk_core` by immutable commit and hash. The original
+`direct_package_consumer` retains Core 0.1.2 compatibility coverage.
+`current_runtime_consumer` pins Core 0.4.0 and separately exercises canonical
+runtime and pipeline construction, owned request headers, explicit OTLP JSON
+export and W3C propagation, and the published HTTP and SDK crypto conformance
+modules. Its standard HTTP and allocation-failure contracts use local fixtures,
+not Azure credentials. The catalog and history checks still cover all registered
+package identities.
 
 ## Branch-owned package work
 
@@ -40,7 +46,7 @@ scripts/package-branch-release.sh verify azure_sdk_storage_blobs
 
 Package manifests must pin internal dependencies by immutable URL and hash.
 Workspace-local `.path` dependencies are not used for released packages; the
-root fixture consumer and codegen pin `azure_sdk_core` by immutable URL and
+root fixture consumers and codegen pin `azure_sdk_core` by immutable URL and
 hash.
 
 ## Reset history tooling

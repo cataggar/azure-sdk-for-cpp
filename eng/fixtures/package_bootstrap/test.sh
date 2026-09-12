@@ -21,13 +21,25 @@ export GIT_AUTHOR_NAME='Bootstrap fixture' GIT_AUTHOR_EMAIL='fixture@example.inv
 export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 export GIT_TERMINAL_PROMPT=0
 
+copy_tooling_snapshot() {
+  local source="$1" destination="$2" path
+  git -C "$source" ls-files -z --cached --others --exclude-standard -- \
+    eng scripts build.zig .gitignore >"$WORK/snapshot-paths"
+  while IFS= read -r -d '' path; do
+    # Include working-tree edits and new sources, but not tracked deletions.
+    if [[ -e "$source/$path" || -L "$source/$path" ]]; then
+      mkdir -p "$destination/$(dirname "$path")"
+      cp -a -- "$source/$path" "$destination/$path"
+    fi
+  done <"$WORK/snapshot-paths"
+}
+
 TOOLING="$WORK/tooling"
 REMOTE="$WORK/remote.git"
 OTHER="$WORK/other.git"
 SOURCE="$WORK/source"
 mkdir "$TOOLING" "$SOURCE"
-cp -R "$ROOT/eng" "$ROOT/scripts" "$TOOLING/"
-cp "$ROOT/build.zig" "$ROOT/.gitignore" "$TOOLING/"
+copy_tooling_snapshot "$ROOT" "$TOOLING"
 git init --quiet "$TOOLING"
 git -C "$TOOLING" add -f eng scripts build.zig .gitignore
 git -C "$TOOLING" commit --quiet -m "Offline tooling snapshot"
@@ -101,8 +113,20 @@ refs >"$WORK/before"
 # Exercise the actual wrappers with different registries and the same global cache.
 CACHE_TOOLING="$WORK/tooling-other"
 mkdir "$CACHE_TOOLING"
-cp -R "$TOOLING/eng" "$TOOLING/scripts" "$CACHE_TOOLING/"
-cp "$TOOLING/build.zig" "$TOOLING/.gitignore" "$CACHE_TOOLING/"
+mkdir -p "$TOOLING/eng/fixtures/direct_package_consumer/.zig-cache" \
+  "$TOOLING/eng/fixtures/direct_package_consumer/zig-pkg"
+printf 'ignored build artifact\n' >"$TOOLING/eng/fixtures/direct_package_consumer/.zig-cache/snapshot-probe"
+printf 'ignored dependency\n' >"$TOOLING/eng/fixtures/direct_package_consumer/zig-pkg/snapshot-probe"
+printf 'pub const snapshot_probe = true;\n' >"$TOOLING/eng/fixture_snapshot_probe.zig"
+copy_tooling_snapshot "$TOOLING" "$CACHE_TOOLING"
+[[ ! -e "$CACHE_TOOLING/eng/fixtures/direct_package_consumer/.zig-cache" &&
+  ! -e "$CACHE_TOOLING/eng/fixtures/direct_package_consumer/zig-pkg" ]] || {
+  echo "FAIL: tooling snapshots must exclude ignored build and dependency artifacts" >&2
+  exit 1
+}
+cmp "$TOOLING/eng/fixture_snapshot_probe.zig" "$CACHE_TOOLING/eng/fixture_snapshot_probe.zig"
+rm -- "$TOOLING/eng/fixture_snapshot_probe.zig"
+printf 'PASS: tooling snapshots retain working-tree sources without ignored artifacts\n'
 sed -e 's/core_symcrypt/core_fixture/g' \
   -e 's/source-check -Dsource_only=true/source-check -Dsource_only=true -Dfixture_second=true/g' \
   "$TOOLING/eng/packages.zig" >"$CACHE_TOOLING/eng/packages.zig"
