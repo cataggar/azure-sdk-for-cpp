@@ -52,7 +52,6 @@ pub const AVSClient = struct {
             .endpoint = self.endpoint,
             .api_version = self.api_version,
             .pipeline = self.pipeline,
-            .subscription_id = self.subscription_id,
         };
     }
 
