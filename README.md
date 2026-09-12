@@ -3,9 +3,9 @@
 Optional Microsoft SymCrypt 103.13.0 provider for
 `azure_sdk_core.crypto.CryptoProvider`.
 
-- Package version: `0.1.0`
+- Package version: `0.2.0`
 - Release branch: `sdk/core_symcrypt`
-- Core dependency: `azure_sdk_core` `0.3.0`
+- Core dependency: `azure_sdk_core` `0.4.0`
 - Native wrapper dependency: `zig_symcrypt` `0.1.0`
 - Supported targets: `x86_64-linux-gnu`, `aarch64-linux-gnu`,
   `x86_64-windows-msvc`, and `aarch64-windows-msvc`
