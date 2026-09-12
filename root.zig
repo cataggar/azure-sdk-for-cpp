@@ -7,7 +7,7 @@ const core = @import("azure_sdk_core");
 const serde = @import("serde");
 
 pub const cosmos_scope = "https://cosmos.azure.com/.default";
-pub const user_agent = "azsdk-zig-data-cosmos/0.2.0";
+pub const user_agent = "azsdk-zig-data-cosmos/0.3.0";
 
 // ─────────────────────── Enums ───────────────────────
 
@@ -101,6 +101,9 @@ pub const CosmosClientOptions = struct {
     consistency_level: ?ConsistencyLevel = null,
     policies: []const *core.http.HttpPolicy = &.{},
     time_source: ?TimeSource = null,
+    /// Disabled by default. The provider, scope strings, and parent tracestate
+    /// are borrowed and must outlive this client and its derived clients.
+    instrumentation: ?core.tracing.InstrumentationOptions = null,
 };
 
 /// Account-level client for Azure Cosmos DB.
@@ -301,6 +304,7 @@ const PipelineState = struct {
         policy_ptrs[4] = state.authentication.asPolicy();
         @memcpy(policy_ptrs[5..], options.policies);
         state.pipeline = core.http.HttpPipeline.init(runtime, policy_ptrs);
+        state.pipeline.setInstrumentation(options.instrumentation);
         return state;
     }
 
@@ -1582,39 +1586,49 @@ test "non-idempotent creates retry only before transport starts" {
 
 test "non-idempotent creates are not replayed after transport starts" {
     const allocator = std.testing.allocator;
-    var transport = FailingCreateTransport{};
-    var client = try CosmosClient.init(
-        allocator,
-        "https://myaccount.documents.azure.com",
-        &testing_credential,
-        testingRuntime(transport.asTransport()),
-        .{},
-    );
-    defer client.deinit();
+    for ([_]bool{ false, true }) |instrumented| {
+        var transport = FailingCreateTransport{};
+        const runtime = testingRuntime(transport.asTransport());
+        var probe = TracingProbe{};
+        var tracing = try probe.createProvider(runtime.crypto);
+        defer tracing.deinit() catch unreachable;
+        var client = try CosmosClient.init(
+            allocator,
+            "https://myaccount.documents.azure.com",
+            &testing_credential,
+            runtime,
+            .{ .instrumentation = if (instrumented) TracingProbe.options(&tracing) else null },
+        );
+        defer client.deinit();
 
-    try std.testing.expectError(
-        error.CosmosCreateOutcomeUnknown,
-        client.createDatabase(allocator, "testdb"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), transport.calls);
+        try std.testing.expectError(
+            error.CosmosCreateOutcomeUnknown,
+            client.createDatabase(allocator, "testdb"),
+        );
+        try std.testing.expectEqual(@as(usize, 1), transport.calls);
 
-    var database = client.database("testdb");
-    try std.testing.expectError(
-        error.CosmosCreateOutcomeUnknown,
-        database.createContainer(allocator, "testcontainer", "/pk"),
-    );
-    try std.testing.expectEqual(@as(usize, 2), transport.calls);
+        var database = client.database("testdb");
+        try std.testing.expectError(
+            error.CosmosCreateOutcomeUnknown,
+            database.createContainer(allocator, "testcontainer", "/pk"),
+        );
+        try std.testing.expectEqual(@as(usize, 2), transport.calls);
 
-    var container = database.container("testcontainer");
-    try std.testing.expectError(
-        error.CosmosCreateOutcomeUnknown,
-        container.createItem(allocator, .{
-            .id = "item1",
-            .partition_key = "[\"pk1\"]",
-            .body = "{\"id\":\"item1\",\"pk\":\"pk1\"}",
-        }),
-    );
-    try std.testing.expectEqual(@as(usize, 3), transport.calls);
+        var container = database.container("testcontainer");
+        try std.testing.expectError(
+            error.CosmosCreateOutcomeUnknown,
+            container.createItem(allocator, .{
+                .id = "item1",
+                .partition_key = "[\"pk1\"]",
+                .body = "{\"id\":\"item1\",\"pk\":\"pk1\"}",
+            }),
+        );
+        try std.testing.expectEqual(@as(usize, 3), transport.calls);
+        try tracing.forceFlush(1000);
+        try std.testing.expectEqual(@as(usize, if (instrumented) 3 else 0), probe.count);
+        for (probe.statuses[0..probe.count]) |status|
+            try std.testing.expectEqual(core.tracing.SpanStatus.@"error", status);
+    }
 }
 
 test "non-idempotent creates do not follow 307 or 308 redirects" {
@@ -1787,4 +1801,197 @@ test "continuation replacement preserves the old token on allocation failure" {
     try replaceContinuationToken(allocator, &current, "header-token");
     defer allocator.free(current.?);
     try std.testing.expectEqualStrings("header-token", current.?);
+}
+
+const TracingProbe = struct {
+    exporter: core.tracing.SpanExporter = .{ .exportFn = exportBatch },
+    count: usize = 0,
+    ids: [8][16]u8 = undefined,
+    statuses: [8]core.tracing.SpanStatus = undefined,
+
+    const parent: core.tracing.TraceContext = .{
+        .trace_id = "0af7651916cd43dd8448eb211c80319c".*,
+        .span_id = "b7ad6b7169203331".*,
+        .trace_flags = 1,
+        .trace_state = "vendor=value",
+    };
+
+    fn createProvider(self: *TracingProbe, crypto: core.crypto.CryptoProvider) !core.tracing.ExportingTracerProvider {
+        return .init(std.testing.allocator, std.testing.io, crypto, &self.exporter, .{
+            .max_spans = 8,
+            .max_queued_spans = 8,
+        });
+    }
+
+    fn options(provider: *core.tracing.ExportingTracerProvider) core.tracing.InstrumentationOptions {
+        return .{
+            .provider = provider.asProvider(),
+            .scope_name = "caller.cosmos",
+            .scope_version = "caller-version",
+            .namespace = "Caller.Cosmos",
+            .parent_context = parent,
+        };
+    }
+
+    fn wireId(mock: *core.http.MockTransport) ![16]u8 {
+        const context = core.tracing.TraceContext.parseTraceparent(
+            mock.last_headers.get("traceparent") orelse return error.MissingTraceparent,
+        ) orelse return error.InvalidTraceparent;
+        try std.testing.expectEqualStrings(&parent.trace_id, &context.trace_id);
+        try std.testing.expect(!std.mem.eql(u8, &parent.span_id, &context.span_id));
+        try std.testing.expectEqualStrings(parent.trace_state.?, mock.last_headers.get("tracestate").?);
+        return context.span_id;
+    }
+
+    fn exportBatch(exporter: *core.tracing.SpanExporter, batch: []const core.tracing.SpanData, _: core.tracing.ExportContext) !void {
+        const self: *TracingProbe = @fieldParentPtr("exporter", exporter);
+        for (batch) |data| {
+            try std.testing.expect(self.count < self.ids.len);
+            try std.testing.expectEqualStrings("caller.cosmos", data.scope_name);
+            try std.testing.expectEqualStrings("caller-version", data.scope_version);
+            try std.testing.expectEqualStrings(&parent.trace_id, &data.context.trace_id);
+            try std.testing.expectEqualStrings(&parent.span_id, &data.parent_span_id.?);
+            var namespace_seen = false;
+            for (data.attributes) |attribute| {
+                if (attribute.value == .string and std.mem.eql(u8, attribute.value.string, "Caller.Cosmos"))
+                    namespace_seen = true;
+            }
+            try std.testing.expect(namespace_seen);
+            self.ids[self.count] = data.context.span_id;
+            self.statuses[self.count] = data.status;
+            self.count += 1;
+        }
+    }
+};
+
+const FailingTracingProvider = struct {
+    provider: core.tracing.TracerProvider = .{ .getTracerFn = getTracer },
+    tracer: core.tracing.Tracer = .{ .startSpanFn = startSpan },
+    attempts: usize = 0,
+
+    fn getTracer(provider: *core.tracing.TracerProvider, _: []const u8, _: []const u8) *core.tracing.Tracer {
+        const self: *FailingTracingProvider = @fieldParentPtr("provider", provider);
+        return &self.tracer;
+    }
+
+    fn startSpan(tracer: *core.tracing.Tracer, _: []const u8, _: core.tracing.SpanKind) !*core.tracing.Span {
+        const self: *FailingTracingProvider = @fieldParentPtr("tracer", tracer);
+        self.attempts += 1;
+        return error.InjectedTracingFailure;
+    }
+};
+
+test "Cosmos tracing inherits through clients without changing raw read create or query data" {
+    const allocator = std.testing.allocator;
+    var mock = core.http.MockTransport.init(allocator, 200, "{\"Databases\":[{\"id\":\"db\"}]}");
+    defer mock.deinit();
+    const runtime = testingRuntime(mock.asTransport());
+    var probe = TracingProbe{};
+    var tracing = try probe.createProvider(runtime.crypto);
+    defer tracing.deinit() catch unreachable;
+    var ids: [5][16]u8 = undefined;
+    {
+        const scope = try allocator.dupe(u8, "caller.cosmos");
+        defer allocator.free(scope);
+        const state = try allocator.dupe(u8, TracingProbe.parent.trace_state.?);
+        defer allocator.free(state);
+        var instrumentation = TracingProbe.options(&tracing);
+        instrumentation.scope_name = scope;
+        instrumentation.parent_context.?.trace_state = state;
+        var client = try CosmosClient.init(
+            allocator,
+            "https://myaccount.documents.azure.com",
+            &testing_credential,
+            runtime,
+            .{ .instrumentation = instrumentation },
+        );
+        defer client.deinit();
+        const databases = try client.listDatabases(allocator);
+        defer {
+            for (databases) |entry| entry.deinit(allocator, true);
+            allocator.free(databases);
+        }
+        try std.testing.expectEqual(@as(usize, 1), databases.len);
+        ids[0] = try TracingProbe.wireId(&mock);
+        var database = client.database("db");
+        mock.response_body = "{\"DocumentCollections\":[{\"id\":\"container\"}]}";
+        const containers = try database.listContainers(allocator);
+        defer {
+            for (containers) |entry| entry.deinit(allocator, true);
+            allocator.free(containers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), containers.len);
+        ids[1] = try TracingProbe.wireId(&mock);
+        var container = database.container("container");
+        const document = "{ \"id\":\"item\", \"nested\":[true,{\"text\":\"a\\\"b\"}], \"n\":1e+02 }";
+        const partition = "[\"a\\\"b\",null,1e+02]";
+        mock.response_body = document;
+        const body = try container.readItem(allocator, "item", partition);
+        defer allocator.free(body);
+        try std.testing.expectEqualStrings(document, body);
+        try std.testing.expectEqualStrings(partition, mock.last_headers.get("x-ms-documentdb-partitionkey").?);
+        ids[2] = try TracingProbe.wireId(&mock);
+
+        const token = "opaque%2B/+==:[]";
+        const headers = [_]core.http.MockTransport.HeaderPair{
+            .{ .name = "x-ms-continuation", .value = token },
+        };
+        mock.response_headers_list = &headers;
+        mock.response_body = "{\"Documents\":[{\"id\":\"item\",\"n\":1e+02}],\"_continuation\":\"body-token\"}";
+        var page = try container.queryItems(allocator, "SELECT * FROM c");
+        defer page.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), page.documents.len);
+        try std.testing.expectEqualStrings("{\"id\":\"item\",\"n\":1e+02}", page.documents[0]);
+        try std.testing.expectEqualStrings(token, page.continuation_token.?);
+        ids[3] = try TracingProbe.wireId(&mock);
+
+        mock.response_body = "{}";
+        try container.createItem(allocator, .{ .id = "item", .partition_key = partition, .body = document });
+        try std.testing.expectEqualStrings(document, mock.last_body.?);
+        try std.testing.expectEqualStrings(partition, mock.last_headers.get("x-ms-documentdb-partitionkey").?);
+        ids[4] = try TracingProbe.wireId(&mock);
+        try std.testing.expectEqual(@as(usize, 5), mock.call_count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.count);
+    try std.testing.expectEqual(@as(usize, 0), tracing.stats().active_spans);
+    try std.testing.expectEqual(@as(usize, 5), tracing.stats().queued_spans);
+    try tracing.forceFlush(1000);
+    try std.testing.expectEqual(@as(usize, 5), probe.count);
+    for (ids, 0..) |id, i| try std.testing.expectEqualStrings(&id, &probe.ids[i]);
+    try tracing.shutdown(1000);
+}
+
+test "disabled or failing Cosmos tracing preserves read results and request counts" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |instrumented| {
+        for ([_]u16{ 200, 404 }) |status| {
+            var mock = core.http.MockTransport.init(allocator, status, "{\"id\":\"item\"}");
+            defer mock.deinit();
+            var tracing = FailingTracingProvider{};
+            var client = try CosmosClient.init(
+                allocator,
+                "https://myaccount.documents.azure.com",
+                &testing_credential,
+                testingRuntime(mock.asTransport()),
+                .{ .instrumentation = if (instrumented) .{
+                    .provider = &tracing.provider,
+                    .scope_name = "caller.cosmos",
+                } else null },
+            );
+            defer client.deinit();
+            var database = client.database("db");
+            var container = database.container("container");
+            if (status == 200) {
+                const body = try container.readItem(allocator, "item", "[\"pk\"]");
+                defer allocator.free(body);
+                try std.testing.expectEqualStrings("{\"id\":\"item\"}", body);
+            } else {
+                try std.testing.expectError(error.ReadItemFailed, container.readItem(allocator, "item", "[\"pk\"]"));
+            }
+            try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+            try std.testing.expectEqual(@as(usize, @intFromBool(instrumented)), tracing.attempts);
+            try std.testing.expect(mock.last_headers.get("traceparent") == null);
+            try std.testing.expect(mock.last_headers.get("tracestate") == null);
+        }
+    }
 }
