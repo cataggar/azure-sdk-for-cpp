@@ -2,9 +2,34 @@
 ///!
 ///! Provides pluggable `TracerProvider` / `Tracer` / `Span` interfaces
 ///! following the fn-pointer pattern used throughout the SDK. A
-///! `NoopTracerProvider` is the default — zero overhead when tracing
-///! is disabled. W3C Trace Context propagation is built in.
+///! Pipelines are uninstrumented by default. Opt in with InstrumentationOptions.
+///! ExportingTracerProvider owns bounded span storage and exports only during
+///! explicit drain/forceFlush/shutdown. See tracing/README.md for lifetimes.
 const std = @import("std");
+
+pub const TraceContext = @import("trace_context.zig").TraceContext;
+pub const AttributeValue = @import("exporter.zig").AttributeValue;
+pub const Attribute = @import("exporter.zig").Attribute;
+pub const SpanData = @import("exporter.zig").SpanData;
+pub const ExportContext = @import("exporter.zig").ExportContext;
+pub const SpanExporter = @import("exporter.zig").SpanExporter;
+pub const ExportingTracerProvider = @import("provider.zig").ExportingTracerProvider;
+pub const OtlpJsonWriterExporter = @import("otlp_json.zig").OtlpJsonWriterExporter;
+
+pub const StartOptions = struct {
+    /// IDs are copied; tracestate is borrowed until startSpanWithOptions returns.
+    parent: ?TraceContext = null,
+};
+
+/// Copied into a pipeline. Provider and nonstatic strings must outlive its copies.
+pub const InstrumentationOptions = struct {
+    provider: *TracerProvider,
+    scope_name: []const u8,
+    scope_version: []const u8 = "",
+    namespace: []const u8 = "",
+    /// Default parent for requests without an explicit context. Tracestate is borrowed.
+    parent_context: ?TraceContext = null,
+};
 
 // ─────────────────── Enums ───────────────────────
 
@@ -29,6 +54,19 @@ pub const Span = struct {
     setAttributeFn: *const fn (self: *Span, key: []const u8, value: []const u8) anyerror!void,
     setStatusFn: *const fn (self: *Span, status: SpanStatus) void,
     endFn: *const fn (self: *Span) void,
+    setTypedAttributeFn: ?*const fn (self: *Span, key: []const u8, value: AttributeValue) anyerror!void = null,
+    getContextFn: ?*const fn (self: *Span) ?TraceContext = null,
+
+    pub fn setTypedAttribute(self: *Span, key: []const u8, value: AttributeValue) !void {
+        if (self.setTypedAttributeFn) |f| return f(self, key, value);
+        if (value == .string) return self.setAttribute(key, value.string);
+        return error.UnsupportedAttributeType;
+    }
+
+    /// Returned tracestate is borrowed until end; copy it to retain it longer.
+    pub fn getContext(self: *Span) ?TraceContext {
+        return if (self.getContextFn) |f| f(self) else null;
+    }
 
     pub fn setAttribute(self: *Span, key: []const u8, value: []const u8) !void {
         return self.setAttributeFn(self, key, value);
@@ -46,6 +84,12 @@ pub const Span = struct {
 /// A tracer that creates spans for a specific service.
 pub const Tracer = struct {
     startSpanFn: *const fn (self: *Tracer, name: []const u8, kind: SpanKind) anyerror!*Span,
+    startSpanWithOptionsFn: ?*const fn (self: *Tracer, name: []const u8, kind: SpanKind, options: StartOptions) anyerror!*Span = null,
+
+    pub fn startSpanWithOptions(self: *Tracer, name: []const u8, kind: SpanKind, options: StartOptions) !*Span {
+        if (self.startSpanWithOptionsFn) |f| return f(self, name, kind, options);
+        return self.startSpan(name, kind);
+    }
 
     pub fn startSpan(self: *Tracer, name: []const u8, kind: SpanKind) !*Span {
         return self.startSpanFn(self, name, kind);
@@ -55,6 +99,11 @@ pub const Tracer = struct {
 /// Factory for creating service-specific tracers.
 pub const TracerProvider = struct {
     getTracerFn: *const fn (self: *TracerProvider, name: []const u8, version: []const u8) *Tracer,
+    recordPropagationErrorFn: ?*const fn (self: *TracerProvider) void = null,
+
+    pub fn recordPropagationError(self: *TracerProvider) void {
+        if (self.recordPropagationErrorFn) |f| f(self);
+    }
 
     pub fn getTracer(self: *TracerProvider, name: []const u8, version: []const u8) *Tracer {
         return self.getTracerFn(self, name, version);
@@ -135,7 +184,7 @@ pub const NoopSpan = struct {
 
 // ─────────────── Recording Implementation ────────
 
-/// A span that records attributes and status for testing / export.
+/// A borrowed-data test helper, not an exporter or concurrent span store.
 pub const RecordingSpan = struct {
     name: []const u8,
     kind: SpanKind,
@@ -210,41 +259,6 @@ pub const RecordingTracer = struct {
     }
 };
 
-// ─────────────── W3C Trace Context ───────────────
-
-/// W3C Trace Context for distributed trace propagation.
-pub const TraceContext = struct {
-    trace_id: [32]u8 = [_]u8{'0'} ** 32,
-    span_id: [16]u8 = [_]u8{'0'} ** 16,
-    trace_flags: u8 = 0,
-    trace_state: ?[]const u8 = null,
-
-    /// Format as W3C traceparent header: `00-{trace_id}-{span_id}-{flags}`
-    pub fn formatTraceparent(self: TraceContext) [55]u8 {
-        var buf: [55]u8 = undefined;
-        _ = std.fmt.bufPrint(&buf, "00-{s}-{s}-{s}", .{
-            &self.trace_id,
-            &self.span_id,
-            std.fmt.bytesToHex([_]u8{self.trace_flags}, .lower),
-        }) catch unreachable;
-        return buf;
-    }
-
-    /// Parse a W3C traceparent header value.
-    pub fn parseTraceparent(header: []const u8) ?TraceContext {
-        // Format: 00-{32 hex trace_id}-{16 hex span_id}-{2 hex flags}
-        if (header.len < 55) return null;
-        if (header[0] != '0' or header[1] != '0' or header[2] != '-') return null;
-        if (header[35] != '-' or header[52] != '-') return null;
-
-        var ctx = TraceContext{};
-        @memcpy(&ctx.trace_id, header[3..35]);
-        @memcpy(&ctx.span_id, header[36..52]);
-        ctx.trace_flags = std.fmt.parseUnsigned(u8, header[53..55], 16) catch return null;
-        return ctx;
-    }
-};
-
 // ─────────────────────── Tests ───────────────────────
 
 test "NoopTracerProvider creates noop spans" {
@@ -300,4 +314,9 @@ test "TraceContext parseTraceparent" {
 test "TraceContext parseTraceparent invalid" {
     try std.testing.expect(TraceContext.parseTraceparent("invalid") == null);
     try std.testing.expect(TraceContext.parseTraceparent("") == null);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("example.zig");
 }
