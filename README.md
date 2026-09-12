@@ -50,7 +50,15 @@ client runtime and no provider is retained by the credential. A pre-formed
 token remains independent of the runtime provider.
 
 The `azure_sdk_core` dependency is pinned to the
-`azure_sdk_core/v0.3.0` release commit and package hash.
+`azure_sdk_core/v0.4.0` release commit
+`be32073994f37422f2f6b5e9255d208b1284de85` and package hash.
+
+This is a Core source/type compatibility release. Messaging Common provides
+SAS and connection-string helpers, not an HTTP service client, and therefore
+does not add instrumentation options, automatic HTTP spans, or propagation.
+Tracing belongs to the calling client/pipeline; its provider and
+flush/shutdown lifecycle remain caller-owned. `HttpRuntime` continues to select
+only HTTP transport and SDK crypto, not tracing.
 
 Use `sas.audienceFor` to build the `amqps://{namespace}/{entity}` resource. An
 entity-scoped token authorizes every partition and consumer group beneath it,
@@ -60,7 +68,7 @@ The CBS token type constants are `cbs_token_type_sas`
 (`servicebus.windows.net:sastoken`) and `cbs_token_type_jwt` (`jwt`).
 
 Release branch: `sdk/messaging_common`. The package depends on
-`azure_sdk_core` and starts at `0.1.0`.
+`azure_sdk_core`; the current package version is `0.4.0`.
 
 ## Development
 
