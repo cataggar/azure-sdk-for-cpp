@@ -27,6 +27,40 @@ TypeSpec. The `.azure-sdk-generator` provenance file records the
 generator revision, the spec revision and the reproducible generation
 command.
 
+## Core 0.4 and optional tracing
+
+Package **0.2.0** pins published **Core 0.4.0** by immutable commit and hash.
+All 44 area roots and their 371 operation groups copy the caller's complete
+pipeline. Configure it once before constructing any area client:
+
+```zig
+var telemetry = core.http.TelemetryPolicy.init("azsdk-zig-azure_rest_devops/0.2.0");
+var policies = [_]*core.http.HttpPolicy{telemetry.asPolicy()};
+var pipeline = core.http.HttpPipeline.init(runtime, &policies);
+pipeline.setInstrumentation(.{
+    .provider = provider.asProvider(),
+    .scope_name = "azure_rest_devops",
+    .scope_version = "0.2.0",
+    .namespace = "Azure.DevOps",
+});
+var git_client = root.git.GitClient.init(pipeline, .{});
+```
+
+The example's `provider` is caller-owned, for example a
+`core.tracing.ExportingTracerProvider`. Scope/version/namespace and default
+parent context are caller choices, preserved without an area-specific override.
+Generated constructors do not grow provider options, synthesize user agents, or
+configure tracing on `HttpRuntime`. The versioned telemetry policy above is
+also caller-configured.
+
+Tracing is off by default; `pipeline.setInstrumentation(null)` disables it for
+future copies. Existing clients retain their copied configuration. Provider,
+exporter, runtime backends, policy storage, scope strings and optional parent
+tracestate must outlive all clients and operations. Clients never flush or shut
+down providers: the caller explicitly exports and shuts down after use.
+Streaming spans end at response headers, not body completion. Generated
+per-call context expansion is deferred to **#465**, not added to every operation.
+
 ## Build and regeneration
 
 ```bash
