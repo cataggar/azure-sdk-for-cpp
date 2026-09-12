@@ -124,11 +124,15 @@ pub const RetryOptions = pipeline_mod.RetryOptions;
 pub const KeyClientOptions = struct {
     retry: RetryOptions = .{},
     scope: []const u8 = default_scope,
+    /// Borrowed tracing configuration; disabled by default. See PipelineState.
+    instrumentation: ?core.tracing.InstrumentationOptions = null,
 };
 
 pub const CryptographyClientOptions = struct {
     retry: RetryOptions = .{},
     scope: []const u8 = default_scope,
+    /// Borrowed tracing configuration; disabled by default. See PipelineState.
+    instrumentation: ?core.tracing.InstrumentationOptions = null,
 };
 
 pub const CreateRsaKeyOptions = struct {
@@ -277,6 +281,7 @@ pub const KeyClient = struct {
             options.retry,
             options.scope,
         );
+        pipeline_state.setInstrumentation(options.instrumentation);
         return .{
             .vault_url = owned_url,
             .pipeline_state = pipeline_state,
@@ -566,6 +571,7 @@ pub const CryptographyClient = struct {
             options.retry,
             options.scope,
         );
+        pipeline_state.setInstrumentation(options.instrumentation);
         return .{
             .key_id = owned_key_id,
             .pipeline_state = pipeline_state,
@@ -1153,18 +1159,22 @@ test "RS512 signing uses exact digest and returns decoded signature bytes" {
         "{\"kid\":\"https://vault.example/keys/ssh-ca/version1\",\"value\":\"-__-\"}",
     );
     defer service_mock.deinit();
+    var probe = test_support.TracingProbe{};
+    var tracing = try probe.createProvider();
+    defer tracing.deinit() catch unreachable;
     var client = try CryptographyClient.init(
         allocator,
         "https://vault.example/keys/ssh-ca/version1",
         credential.asCredential(),
         test_support.runtime(service_mock.asTransport()),
-        .{},
+        .{ .instrumentation = test_support.TracingProbe.options(&tracing) },
     );
     defer client.deinit();
 
     const digest = [_]u8{0} ** 64;
     var signature = try client.sign(allocator, .rs512, &digest);
     defer signature.deinit(allocator);
+    try probe.expectSingleSpan(&tracing, &service_mock);
     try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0xff, 0xfe }, signature.bytes);
     try std.testing.expectEqualStrings("Bearer test-token", service_mock.last_headers.get("Authorization").?);
     try std.testing.expectEqualStrings(
@@ -1572,12 +1582,18 @@ test "selected crypto failure prevents derived cryptography transport dispatch" 
         crypto_spy.asProvider(),
     );
     var credential = test_support.StaticCredential{};
+    var probe = test_support.TracingProbe{};
+    var tracing = try probe.createProvider();
+    defer tracing.deinit() catch unreachable;
     var client = try KeyClient.init(
         allocator,
         "https://vault.example",
         credential.asCredential(),
         runtime,
-        .{ .retry = .{ .max_retries = 0 } },
+        .{
+            .retry = .{ .max_retries = 0 },
+            .instrumentation = test_support.TracingProbe.options(&tracing),
+        },
     );
     defer client.deinit();
     var cryptography = try client.getCryptographyClient(
@@ -1611,6 +1627,75 @@ test "selected crypto failure prevents derived cryptography transport dispatch" 
     try std.testing.expectEqual(@as(usize, 2), crypto_spy.random_calls);
     try std.testing.expectEqual(@as(usize, 0), credential.calls);
     try std.testing.expectEqual(@as(usize, 0), transport.call_count);
+    try tracing.forceFlush(1000);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    for (probe.statuses[0..probe.count]) |status|
+        try std.testing.expectEqual(core.tracing.SpanStatus.@"error", status);
+}
+
+test "KeyClient tracing survives borrowed cryptography and pager teardown" {
+    const allocator = std.testing.allocator;
+    var mock = core.http.MockTransport.init(allocator, 200, key_response);
+    defer mock.deinit();
+    var probe = test_support.TracingProbe{};
+    var tracing = try probe.createProvider();
+    defer tracing.deinit() catch unreachable;
+    var ids: [3][16]u8 = undefined;
+    {
+        const scope = try allocator.dupe(u8, "caller.keyvault");
+        defer allocator.free(scope);
+        const state = try allocator.dupe(u8, test_support.TracingProbe.parent.trace_state.?);
+        defer allocator.free(state);
+        var instrumentation = test_support.TracingProbe.options(&tracing);
+        instrumentation.scope_name = scope;
+        instrumentation.parent_context.?.trace_state = state;
+        var credential = test_support.StaticCredential{};
+        var client = try KeyClient.init(
+            allocator,
+            "https://vault.example",
+            credential.asCredential(),
+            test_support.runtime(mock.asTransport()),
+            .{ .instrumentation = instrumentation },
+        );
+        defer client.deinit();
+        var key = try client.getKeyVersion(allocator, "ssh-ca", "version1");
+        defer key.deinit(allocator);
+        try std.testing.expectEqualStrings("https://vault.example/keys/ssh-ca/version1", key.id);
+        ids[0] = try test_support.TracingProbe.wireId(&mock);
+
+        var cryptography = try client.getCryptographyClient(allocator, key.id);
+        defer cryptography.deinit();
+        try std.testing.expect(!cryptography.owns_pipeline_state);
+        try std.testing.expectEqual(client.pipeline_state, cryptography.pipeline_state);
+        mock.response_body = "{\"kid\":\"https://vault.example/keys/ssh-ca/version1\",\"value\":\"-__-\"}";
+        const digest = [_]u8{0} ** 64;
+        var signature = try cryptography.sign(allocator, .rs512, &digest);
+        defer signature.deinit(allocator);
+        try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0xff, 0xfe }, signature.bytes);
+        ids[1] = try test_support.TracingProbe.wireId(&mock);
+
+        mock.response_body = key_list_response;
+        var pager = try client.listKeys(allocator, null);
+        defer pager.deinit();
+        const page = (try pager.next()) orelse return error.ExpectedPage;
+        defer {
+            for (page) |*entry| entry.deinit(allocator);
+            allocator.free(page);
+        }
+        try std.testing.expectEqual(@as(usize, 1), page.len);
+        try std.testing.expectEqualStrings("operation-123", page[0].tagValue("operation-id").?);
+        ids[2] = try test_support.TracingProbe.wireId(&mock);
+        try std.testing.expectEqual(@as(usize, 3), mock.call_count);
+        try std.testing.expectEqual(@as(usize, 1), credential.calls);
+        try std.testing.expectEqualStrings(default_scope, credential.last_scope.?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.count);
+    try std.testing.expectEqual(@as(usize, 0), tracing.stats().active_spans);
+    try std.testing.expectEqual(@as(usize, 3), tracing.stats().queued_spans);
+    try tracing.forceFlush(1000);
+    try std.testing.expectEqual(@as(usize, 3), probe.count);
+    for (ids, 0..) |id, i| try std.testing.expectEqualStrings(&id, &probe.ids[i]);
+    try tracing.shutdown(1000);
 }
 
 const key_response =

@@ -53,6 +53,8 @@ pub const SecretClientOptions = struct {
     api_version: []const u8 = "7.6-preview.2",
     retry: pipeline_mod.RetryOptions = .{},
     scope: []const u8 = pipeline_mod.default_scope,
+    /// Borrowed tracing configuration; disabled by default. See PipelineState.
+    instrumentation: ?core.tracing.InstrumentationOptions = null,
 };
 
 /// Client for Azure Key Vault Secrets.
@@ -74,16 +76,18 @@ pub const SecretClient = struct {
         runtime: core.http.HttpRuntime,
         options: SecretClientOptions,
     ) !SecretClient {
+        const pipeline_state = try pipeline_mod.PipelineState.create(
+            allocator,
+            credential,
+            runtime,
+            options.retry,
+            options.scope,
+        );
+        pipeline_state.setInstrumentation(options.instrumentation);
         return .{
             .vault_url = vault_url,
             .api_version = options.api_version,
-            .pipeline_state = try pipeline_mod.PipelineState.create(
-                allocator,
-                credential,
-                runtime,
-                options.retry,
-                options.scope,
-            ),
+            .pipeline_state = pipeline_state,
         };
     }
 
@@ -722,4 +726,98 @@ test "SecretClient pager rejects cross-origin continuation before dispatch" {
         "https://v.vault.azure.net/secrets?api-version=7.6-preview.2",
         mock.last_url.?,
     );
+}
+
+test "SecretClient pager inherits tracing and retains opaque continuation data" {
+    const allocator = std.testing.allocator;
+    const continuation = "https://v.vault.azure.net/secrets?$skiptoken=opaque%2B%2F%3D";
+    var mock = core.http.MockTransport.init(
+        allocator,
+        200,
+        "{\"value\":[{\"id\":\"https://v.vault.azure.net/secrets/one\"}],\"nextLink\":\"" ++ continuation ++ "\"}",
+    );
+    defer mock.deinit();
+    var probe = test_support.TracingProbe{};
+    var tracing = try probe.createProvider();
+    defer tracing.deinit() catch unreachable;
+    var ids: [2][16]u8 = undefined;
+    {
+        var credential = test_support.StaticCredential{};
+        var client = try SecretClient.init(
+            allocator,
+            "https://v.vault.azure.net",
+            credential.asCredential(),
+            test_support.runtime(mock.asTransport()),
+            .{ .instrumentation = test_support.TracingProbe.options(&tracing) },
+        );
+        defer client.deinit();
+        var pager = try client.listSecrets(allocator);
+        defer pager.deinit();
+        const names = (try pager.next()) orelse return error.ExpectedPage;
+        defer {
+            for (names) |name| allocator.free(name);
+            allocator.free(names);
+        }
+        try std.testing.expectEqual(@as(usize, 1), names.len);
+        try std.testing.expectEqualStrings("one", names[0]);
+        try std.testing.expectEqualStrings(continuation, pager.next_url.?);
+        ids[0] = try test_support.TracingProbe.wireId(&mock);
+        mock.response_body = "{\"value\":[]}";
+        const last = (try pager.next()) orelse return error.ExpectedPage;
+        defer allocator.free(last);
+        try std.testing.expectEqual(@as(usize, 0), last.len);
+        try std.testing.expectEqualStrings(continuation, mock.last_url.?);
+        ids[1] = try test_support.TracingProbe.wireId(&mock);
+        try std.testing.expect((try pager.next()) == null);
+        try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+        try std.testing.expectEqualStrings(pipeline_mod.default_scope, credential.last_scope.?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.count);
+    try std.testing.expectEqual(@as(usize, 0), tracing.stats().active_spans);
+    try std.testing.expectEqual(@as(usize, 2), tracing.stats().queued_spans);
+    try tracing.forceFlush(1000);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    for (ids, 0..) |id, i| try std.testing.expectEqualStrings(&id, &probe.ids[i]);
+    try tracing.shutdown(1000);
+}
+
+test "disabled or failing tracing preserves SecretClient structured results" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |instrumented| {
+        for ([_]u16{ 200, 404 }) |status| {
+            var mock = core.http.MockTransport.init(
+                allocator,
+                status,
+                if (status == 200) "{\"value\":\"secret-value\"}" else "{\"error\":{\"code\":\"SecretNotFound\"}}",
+            );
+            defer mock.deinit();
+            var credential = test_support.StaticCredential{};
+            var tracing = test_support.FailingTracingProvider{};
+            var client = try SecretClient.init(
+                allocator,
+                "https://v.vault.azure.net",
+                credential.asCredential(),
+                test_support.runtime(mock.asTransport()),
+                .{ .instrumentation = if (instrumented) .{
+                    .provider = &tracing.provider,
+                    .scope_name = "caller.keyvault",
+                } else null },
+            );
+            defer client.deinit();
+            var result = try client.getSecretResult(allocator, "secret");
+            defer result.deinit(allocator);
+            if (status == 200) {
+                try std.testing.expect(result.isOk());
+                try std.testing.expectEqualStrings("secret-value", result.ok.value.?);
+            } else {
+                try std.testing.expect(!result.isOk());
+                try std.testing.expectEqual(@as(u16, 404), result.err.status_code);
+                try std.testing.expectEqualStrings("SecretNotFound", result.errorCode().?);
+            }
+            try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+            try std.testing.expectEqual(@as(usize, @intFromBool(instrumented)), tracing.attempts);
+            try std.testing.expect(mock.last_headers.get("traceparent") == null);
+            try std.testing.expect(mock.last_headers.get("tracestate") == null);
+        }
+    }
 }

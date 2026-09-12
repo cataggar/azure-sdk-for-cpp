@@ -30,6 +30,8 @@ pub const PipelineState = struct {
     policies: [3]*core.http.HttpPolicy,
     pipeline: core.http.HttpPipeline,
 
+    /// Creates an uninstrumented pipeline. Client constructors configure
+    /// instrumentation before exposing this state to any borrowers.
     pub fn create(
         allocator: std.mem.Allocator,
         credential: *core.credentials.TokenCredential,
@@ -67,6 +69,16 @@ pub const PipelineState = struct {
         };
         state.pipeline = core.http.HttpPipeline.init(runtime, &state.policies);
         return state;
+    }
+
+    /// Configure before creating any derived client or pager. The provider,
+    /// scope strings, and parent tracestate remain caller-owned and must
+    /// outlive every borrower. This state never flushes or shuts them down.
+    pub fn setInstrumentation(
+        self: *PipelineState,
+        options: ?core.tracing.InstrumentationOptions,
+    ) void {
+        self.pipeline.setInstrumentation(options);
     }
 
     pub fn deinit(self: *PipelineState) void {
