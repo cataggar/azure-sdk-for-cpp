@@ -29,9 +29,9 @@ pub const Client = struct {
     is_root: bool = true,
     parent_name: ?[]const u8 = null,
     /// Typed client-level state propagated through the sub-client tree
-    /// (e.g. ARM's `subscription_id`). The emitter places each entry as
-    /// a struct field on every client in the family, and as a required
-    /// field on the root's `InitOptions`.
+    /// (e.g. ARM's `subscription_id`). The emitter places each entry on
+    /// this client, and on `InitOptions` for roots. Sub-client accessors
+    /// inherit only fields declared by that child from its parent.
     init_parameters: []InitParameter = &.{},
     /// Default api-version string read from TCGC's `apiVersion`
     /// `clientDefaultValue`. Used to populate `InitOptions.api_version`.

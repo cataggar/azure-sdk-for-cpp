@@ -599,7 +599,7 @@ fn renderClient(
     }
 
     for (c.sub_clients) |sc| {
-        try renderSubClientAccessor(w, c, sc);
+        try renderSubClientAccessor(allocator, w, model, c, sc);
     }
 
     for (c.methods) |m| {
@@ -666,10 +666,18 @@ fn renderRootInit(allocator: std.mem.Allocator, w: *std.Io.Writer, c: cm.Client)
     );
 }
 
-fn renderSubClientAccessor(w: *std.Io.Writer, parent: cm.Client, sc: cm.SubClient) !void {
-    var buffer: [256]u8 = undefined;
-    var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
-    const accessor = try memberName(fixed.allocator(), sc.accessor_camel);
+fn renderSubClientAccessor(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    model: cm.CodeModel,
+    parent: cm.Client,
+    sc: cm.SubClient,
+) !void {
+    const child = for (model.clients) |client| {
+        if (std.mem.eql(u8, client.name, sc.client_name)) break client;
+    } else return error.UnknownSubClient;
+    const accessor = try memberName(allocator, sc.accessor_camel);
+    defer allocator.free(accessor);
     try w.print(
         \\
         \\    pub fn {[acc]s}(self: *@This()) {[name]s} {{
@@ -679,8 +687,14 @@ fn renderSubClientAccessor(w: *std.Io.Writer, parent: cm.Client, sc: cm.SubClien
         \\            .pipeline = self.pipeline,
         \\
     , .{ .acc = accessor, .name = sc.client_name });
-    for (parent.init_parameters) |p| {
-        try w.print("            .{s} = self.{s},\n", .{ p.name, p.name });
+    for (child.init_parameters) |p| {
+        const inherited = for (parent.init_parameters) |parameter| {
+            if (std.mem.eql(u8, parameter.name, p.name)) break true;
+        } else false;
+        if (!inherited) return error.MissingSubClientParameter;
+        const id = try ids.quoteIfNeeded(allocator, p.name);
+        defer allocator.free(id);
+        try w.print("            .{s} = self.{s},\n", .{ id, id });
     }
     try w.writeAll(
         \\        };
@@ -3113,6 +3127,77 @@ test "REST package metadata supports local and pinned azure_sdk_core dependencie
             "../../sdk/core",
         ),
     );
+}
+
+test "sub-client accessors forward only the child's declared state and preserve the pipeline" {
+    const allocator = std.testing.allocator;
+    var parameters = [_]cm.InitParameter{
+        .{ .name = "subscription_id", .serialized_name = "subscriptionId", .param_type = .{ .kind = "Scalar", .value = .{ .string = "string" } } },
+        .{ .name = "error", .serialized_name = "error", .param_type = .{ .kind = "Scalar", .value = .{ .string = "string" } } },
+    };
+    var accessors = [_]cm.SubClient{
+        .{ .accessor_camel = "operations", .accessor_snake = "operations", .client_name = "Operations" },
+        .{ .accessor_camel = "resources", .accessor_snake = "resources", .client_name = "Resources" },
+        .{ .accessor_camel = "errors", .accessor_snake = "errors", .client_name = "Errors" },
+    };
+    var nested = [_]cm.SubClient{
+        .{ .accessor_camel = "nested", .accessor_snake = "nested", .client_name = "Nested" },
+    };
+    const endpoint: cm.Endpoint = .{ .name = "endpoint" };
+    var clients = [_]cm.Client{
+        .{ .name = "RootClient", .endpoint = endpoint, .init_parameters = &parameters, .sub_clients = &accessors },
+        .{ .name = "Operations", .endpoint = endpoint, .is_root = false },
+        .{ .name = "Resources", .endpoint = endpoint, .is_root = false, .init_parameters = parameters[0..1], .sub_clients = &nested },
+        .{ .name = "Errors", .endpoint = endpoint, .is_root = false, .init_parameters = parameters[1..2] },
+        .{ .name = "Nested", .endpoint = endpoint, .is_root = false, .init_parameters = parameters[0..1] },
+    };
+    const model: cm.CodeModel = .{
+        .package_name = "azure_rest_fixture",
+        .package_version = "0.1.0",
+        .target_kind = "arm",
+        .service_kind = "default",
+        .clients = &clients,
+    };
+    const rendered = try renderClients(allocator, model);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\    pub fn operations(self: *@This()) Operations {
+        \\        return .{
+        \\            .endpoint = self.endpoint,
+        \\            .api_version = self.api_version,
+        \\            .pipeline = self.pipeline,
+        \\        };
+        \\    }
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\    pub fn resources(self: *@This()) Resources {
+        \\        return .{
+        \\            .endpoint = self.endpoint,
+        \\            .api_version = self.api_version,
+        \\            .pipeline = self.pipeline,
+        \\            .subscription_id = self.subscription_id,
+        \\        };
+        \\    }
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\    pub fn errors(self: *@This()) Errors {
+        \\        return .{
+        \\            .endpoint = self.endpoint,
+        \\            .api_version = self.api_version,
+        \\            .pipeline = self.pipeline,
+        \\            .@"error" = self.@"error",
+        \\        };
+        \\    }
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, ".pipeline = self.pipeline,"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, ".subscription_id = self.subscription_id,"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, ".@\"error\" = self.@\"error\","));
+
+    clients[2].init_parameters = &.{};
+    try std.testing.expectError(error.MissingSubClientParameter, renderClients(allocator, model));
+    clients[2].init_parameters = parameters[0..1];
+    accessors[0].client_name = "Missing";
+    try std.testing.expectError(error.UnknownSubClient, renderClients(allocator, model));
 }
 
 test "bodyless success status alternatives preserve the void API" {
