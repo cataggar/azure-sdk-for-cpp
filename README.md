@@ -28,6 +28,39 @@ outlive every generated client and active operation.
 Generated result fields follow their declared allocator ownership; free
 or deinitialize every owned body/header/model value shown by the type.
 
+## Core 0.4 and optional tracing
+
+Package **0.3.0** adopts the published **Core 0.4.0** release. Configure optional
+instrumentation on the caller's pipeline before constructing a client:
+
+```zig
+var telemetry = core.http.TelemetryPolicy.init("azsdk-zig-azure_rest_container_registry/0.3.0");
+var policies = [_]*core.http.HttpPolicy{telemetry.asPolicy()};
+var pipeline = core.http.HttpPipeline.init(runtime, &policies);
+pipeline.setInstrumentation(.{
+    .provider = provider.asProvider(),
+    .scope_name = "azure_rest_container_registry",
+    .scope_version = "0.3.0",
+    .namespace = "Microsoft.ContainerRegistry",
+});
+var client = ContainerRegistryClient.init(pipeline, .{ .endpoint = endpoint });
+```
+
+`provider` is a caller-owned tracing provider, such as
+`core.tracing.ExportingTracerProvider`. Every generated subgroup copies the
+complete pipeline: caller scope/version/namespace, default parent context, and
+policies are preserved, never overwritten with package defaults. Constructors
+do not add provider parameters or configure tracing on `HttpRuntime`.
+
+Tracing is disabled by default. `pipeline.setInstrumentation(null)` disables it
+for future copies; changing the original pipeline does not reconfigure existing
+clients. Provider/exporter, runtime backends, policy storage, scope strings and
+optional parent tracestate must outlive every copy and operation. Clients never
+flush or shut down providers; the application exports and shuts down explicitly.
+Streaming spans end at response headers, not body completion. Generated per-call
+context expansion remains deferred to **#465**. User-agent policies remain
+caller-configured, as in the versioned example above.
+
 ## Media types
 
 The REST package transports caller-provided media types. The hand-written
