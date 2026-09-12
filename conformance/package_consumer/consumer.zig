@@ -24,7 +24,7 @@ test "manifest-filtered package exports usable conformance modules" {
         std.testing.io,
         crypto.standardProviderFactory(),
     );
-    try std.testing.expectEqualStrings("0.3.0", core.version);
+    try std.testing.expectEqualStrings("0.4.0", core.version);
 }
 
 test "manifest-filtered package exports owned request headers with infallible trace restoration" {
