@@ -21,6 +21,8 @@ pub const BackupClientOptions = struct {
     api_version: []const u8 = "7.6-preview.2",
     retry: pipeline_mod.RetryOptions = .{},
     scope: []const u8 = pipeline_mod.default_scope,
+    /// Borrowed tracing configuration; disabled by default. See PipelineState.
+    instrumentation: ?core.tracing.InstrumentationOptions = null,
 };
 
 /// Runtime descriptors are copied by value. Their borrowed transport and
@@ -39,16 +41,18 @@ pub const BackupClient = struct {
         runtime: core.http.HttpRuntime,
         options: BackupClientOptions,
     ) !BackupClient {
+        const pipeline_state = try pipeline_mod.PipelineState.create(
+            allocator,
+            credential,
+            runtime,
+            options.retry,
+            options.scope,
+        );
+        pipeline_state.setInstrumentation(options.instrumentation);
         return .{
             .vault_url = vault_url,
             .api_version = options.api_version,
-            .pipeline_state = try pipeline_mod.PipelineState.create(
-                allocator,
-                credential,
-                runtime,
-                options.retry,
-                options.scope,
-            ),
+            .pipeline_state = pipeline_state,
         };
     }
 
@@ -196,6 +200,8 @@ pub const SettingsClientOptions = struct {
     api_version: []const u8 = "7.6-preview.2",
     retry: pipeline_mod.RetryOptions = .{},
     scope: []const u8 = pipeline_mod.default_scope,
+    /// Borrowed tracing configuration; disabled by default. See PipelineState.
+    instrumentation: ?core.tracing.InstrumentationOptions = null,
 };
 
 /// Runtime descriptors are copied by value. Their borrowed transport and
@@ -214,16 +220,18 @@ pub const SettingsClient = struct {
         runtime: core.http.HttpRuntime,
         options: SettingsClientOptions,
     ) !SettingsClient {
+        const pipeline_state = try pipeline_mod.PipelineState.create(
+            allocator,
+            credential,
+            runtime,
+            options.retry,
+            options.scope,
+        );
+        pipeline_state.setInstrumentation(options.instrumentation);
         return .{
             .vault_url = vault_url,
             .api_version = options.api_version,
-            .pipeline_state = try pipeline_mod.PipelineState.create(
-                allocator,
-                credential,
-                runtime,
-                options.retry,
-                options.scope,
-            ),
+            .pipeline_state = pipeline_state,
         };
     }
 
@@ -400,17 +408,21 @@ test "BackupClient beginBackup" {
     defer mock.deinit();
 
     var credential = test_support.StaticCredential{};
+    var probe = test_support.TracingProbe{};
+    var tracing = try probe.createProvider();
+    defer tracing.deinit() catch unreachable;
     var client = try BackupClient.init(
         allocator,
         "https://vault.managedhsm.azure.net",
         credential.asCredential(),
         test_support.runtime(mock.asTransport()),
-        .{},
+        .{ .instrumentation = test_support.TracingProbe.options(&tracing) },
     );
     defer client.deinit();
 
     const op_id = try client.beginBackup(allocator, "https://storage.blob.core.windows.net/backup", "sas-token");
     defer allocator.free(op_id);
+    try probe.expectSingleSpan(&tracing, &mock);
 
     try std.testing.expectEqualStrings("backup-op-001", op_id);
     try std.testing.expectEqual(core.http.Method.POST, mock.last_method.?);
@@ -425,17 +437,21 @@ test "SettingsClient getSetting" {
     defer mock.deinit();
 
     var credential = test_support.StaticCredential{};
+    var probe = test_support.TracingProbe{};
+    var tracing = try probe.createProvider();
+    defer tracing.deinit() catch unreachable;
     var client = try SettingsClient.init(
         allocator,
         "https://vault.managedhsm.azure.net",
         credential.asCredential(),
         test_support.runtime(mock.asTransport()),
-        .{},
+        .{ .instrumentation = test_support.TracingProbe.options(&tracing) },
     );
     defer client.deinit();
 
     const value = try client.getSetting(allocator, "AllowKeyManagementOperationsThroughARM");
     defer allocator.free(value);
+    try probe.expectSingleSpan(&tracing, &mock);
 
     try std.testing.expectEqualStrings("true", value);
     try std.testing.expect(std.mem.find(u8, mock.last_url.?, "settings/AllowKeyManagementOperationsThroughARM") != null);

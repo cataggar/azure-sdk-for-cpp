@@ -36,6 +36,8 @@ pub const CertificateClientOptions = struct {
     api_version: []const u8 = "7.6-preview.2",
     retry: pipeline_mod.RetryOptions = .{},
     scope: []const u8 = pipeline_mod.default_scope,
+    /// Borrowed tracing configuration; disabled by default. See PipelineState.
+    instrumentation: ?core.tracing.InstrumentationOptions = null,
 };
 
 /// Runtime descriptors are copied by value. Their borrowed transport and
@@ -54,16 +56,18 @@ pub const CertificateClient = struct {
         runtime: core.http.HttpRuntime,
         options: CertificateClientOptions,
     ) !CertificateClient {
+        const pipeline_state = try pipeline_mod.PipelineState.create(
+            allocator,
+            credential,
+            runtime,
+            options.retry,
+            options.scope,
+        );
+        pipeline_state.setInstrumentation(options.instrumentation);
         return .{
             .vault_url = vault_url,
             .api_version = options.api_version,
-            .pipeline_state = try pipeline_mod.PipelineState.create(
-                allocator,
-                credential,
-                runtime,
-                options.retry,
-                options.scope,
-            ),
+            .pipeline_state = pipeline_state,
         };
     }
 
@@ -325,17 +329,21 @@ test "CertificateClient getCertificate" {
     defer mock.deinit();
 
     var credential = test_support.StaticCredential{};
+    var probe = test_support.TracingProbe{};
+    var tracing = try probe.createProvider();
+    defer tracing.deinit() catch unreachable;
     var client = try CertificateClient.init(
         allocator,
         "https://vault.azure.net",
         credential.asCredential(),
         test_support.runtime(mock.asTransport()),
-        .{},
+        .{ .instrumentation = test_support.TracingProbe.options(&tracing) },
     );
     defer client.deinit();
 
     const cert = try client.getCertificate(allocator, "mycert");
     defer allocator.free(cert.id.?);
+    try probe.expectSingleSpan(&tracing, &mock);
 
     try std.testing.expectEqualStrings("mycert", cert.name);
     try std.testing.expectEqual(true, cert.properties.enabled.?);

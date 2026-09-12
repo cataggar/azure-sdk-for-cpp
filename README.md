@@ -11,8 +11,8 @@ One independently versioned Key Vault package with four namespaces:
 
 - Source: `sdk/keyvault`
 - Release branch: `sdk/keyvault`
-- Current version: `0.2.0`
-- Dependencies: `azure_sdk_core` and `serde`
+- Current version: `0.3.0`
+- Dependencies: `azure_sdk_core` `0.4.0` and `serde`
 
 All clients require an explicit `core.http.HttpRuntime`, so applications select
 the HTTP transport and SDK crypto provider independently:
@@ -49,6 +49,56 @@ serialize every operation sharing a client's pipeline state, including pager
 operations and calls through derived cryptography clients, even when the
 selected transport and crypto backends are independently synchronized. The
 package installs no fallback crypto provider.
+
+## Opt-in tracing
+
+All six client option types accept the full
+`?core.tracing.InstrumentationOptions`, defaulting to `null`:
+`SecretClientOptions`, `CertificateClientOptions`, `KeyClientOptions`,
+`CryptographyClientOptions`, `BackupClientOptions` and `SettingsClientOptions`.
+No new constructor or runtime is required:
+
+```zig
+var client = try keyvault.secrets.SecretClient.init(
+    allocator,
+    "https://my-vault.vault.azure.net",
+    credential,
+    runtime,
+    .{ .instrumentation = .{
+        .provider = provider.asProvider(),
+        .scope_name = "azure_sdk_keyvault",
+        .scope_version = "0.3.0",
+        .namespace = "Microsoft.KeyVault",
+        .parent_context = parent, // Optional core.tracing.TraceContext.
+    } },
+);
+defer client.deinit();
+```
+
+The example scope is not a default. Explicit scope/version/namespace/default
+parent values are preserved; `options.scope` remains the separate OAuth token
+scope. With `instrumentation = null`, no automatic spans or trace headers are
+added. Constructors configure the shared state before it can be copied into
+pagers or borrowed by `KeyClient.getCryptographyClient`. Derived cryptography
+clients inherit the parent's configuration and do not acquire ownership.
+The low-level `PipelineState.create` signature remains unchanged and creates
+an uninstrumented state; `setInstrumentation` configures it before sharing.
+
+Providers and exporters/sinks stay application-owned and address-stable.
+Keep them, their backing resources, nonstatic scope/version/namespace strings
+and default-parent tracestate alive until every client, borrowed descendant,
+pager and operation has finished. Deinitialize derived clients/pagers before
+their owning client. Clients never drain, flush, shut down or deinitialize
+providers. For Core's
+[`ExportingTracerProvider`](https://github.com/cataggar/azure-sdk-for-zig/blob/azure_sdk_core/v0.4.0/tracing/README.md),
+the application explicitly calls bounded `drain(timeout_ms)`,
+`forceFlush(timeout_ms)` and `shutdown(timeout_ms)` as appropriate; there is no
+hidden worker or network exporter. Core streaming spans end at response headers,
+not after body consumption; SDK result parsing is outside the HTTP span.
+Per-call context parameters remain deferred to
+[#465](https://github.com/cataggar/azure-sdk-for-zig/issues/465).
+
+## Operation behavior
 
 Authenticated pagers accept continuation URLs only when they are absolute
 HTTPS URLs on the original vault's effective host and port. Cross-origin,
