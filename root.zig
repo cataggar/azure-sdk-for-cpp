@@ -10,8 +10,8 @@ pub const auth_scopes: []const []const u8 = &.{"https://azconfig.io/.default"};
 /// Pager type returned by `listSettings`.
 ///
 /// The pager copies the client's pipeline while borrowing its policy,
-/// transport, and crypto-provider contexts. Those contexts must outlive the
-/// pager and every `next` call.
+/// transport, crypto-provider, and optional instrumentation contexts. Those
+/// contexts must outlive the pager and every `next` call.
 pub const SettingPager = core.pager.PipelinePager(ConfigurationSetting);
 
 pub const ConfigurationSetting = struct {
@@ -49,6 +49,7 @@ pub const ConfigurationClient = struct {
     /// The endpoint and API version, the pipeline's policy pointers, and its
     /// runtime transport and crypto-provider contexts are borrowed. They must
     /// outlive this client, every pager derived from it, and all operations.
+    /// Optional tracing provider/configuration strings have the same lifetime.
     pub fn init(
         endpoint: []const u8,
         pipeline: core.http.HttpPipeline,
@@ -576,4 +577,123 @@ test "SettingPager preserves runtime and propagates provider failure" {
     try std.testing.expectError(error.ProviderFailure, pager.next());
     try std.testing.expectEqual(@as(usize, 2), crypto_provider.calls);
     try std.testing.expectEqual(@as(usize, 1), mock_list.call_count);
+}
+
+const TracingProbe = struct {
+    exporter: core.tracing.SpanExporter = .{ .exportFn = &exportBatch },
+    span_ids: [8][16]u8 = undefined,
+    dispatched: usize = 0,
+    exported: usize = 0,
+
+    fn capture(self: *TracingProbe, transport: *core.http.MockTransport, enabled: bool) !void {
+        const traceparent = transport.last_headers.get("traceparent");
+        const tracestate = transport.last_headers.get("tracestate");
+        if (enabled) {
+            const context = core.tracing.TraceContext.parseTraceparent(traceparent orelse return error.MissingTraceparent) orelse
+                return error.InvalidTraceparent;
+            try std.testing.expectEqualStrings("0af7651916cd43dd8448eb211c80319c", &context.trace_id);
+            try std.testing.expectEqualStrings("vendor=value", tracestate orelse "");
+            try std.testing.expect(!std.mem.eql(u8, "b7ad6b7169203331", &context.span_id));
+            for (self.span_ids[0..self.dispatched]) |previous|
+                try std.testing.expect(!std.mem.eql(u8, &previous, &context.span_id));
+            self.span_ids[self.dispatched] = context.span_id;
+        } else {
+            try std.testing.expect(traceparent == null and tracestate == null);
+        }
+        self.dispatched += 1;
+    }
+
+    fn exportBatch(exporter: *core.tracing.SpanExporter, batch: []const core.tracing.SpanData, _: core.tracing.ExportContext) !void {
+        const self: *TracingProbe = @fieldParentPtr("exporter", exporter);
+        for (batch) |span| {
+            try std.testing.expect(self.exported < self.dispatched);
+            try std.testing.expectEqualStrings("caller.scope", span.scope_name);
+            try std.testing.expectEqualStrings("caller-version", span.scope_version);
+            try std.testing.expectEqual(core.tracing.SpanKind.client, span.kind);
+            try std.testing.expectEqualStrings("b7ad6b7169203331", &span.parent_span_id.?);
+            try std.testing.expectEqualStrings("0af7651916cd43dd8448eb211c80319c", &span.context.trace_id);
+            try std.testing.expectEqualStrings("vendor=value", span.context.trace_state orelse "");
+            try std.testing.expectEqualStrings(&self.span_ids[self.exported], &span.context.span_id);
+            var namespace_seen = false;
+            for (span.attributes) |attribute| {
+                if (!std.mem.eql(u8, "az.namespace", attribute.key)) continue;
+                try std.testing.expect(attribute.value == .string);
+                try std.testing.expectEqualStrings("Caller.Namespace", attribute.value.string);
+                namespace_seen = true;
+            }
+            try std.testing.expect(namespace_seen);
+            self.exported += 1;
+        }
+    }
+};
+
+test "caller tracing survives ConfigurationClient and multi-page pager copies, or stays disabled" {
+    for ([_]bool{ true, false }) |enabled| {
+        const allocator = std.testing.allocator;
+        var transport = core.http.MockTransport.init(allocator, 200,
+            \\{"key":"app.color","value":"blue"}
+        );
+        defer transport.deinit();
+        var crypto = core.crypto.StdCryptoProvider.init(std.testing.io);
+        const runtime = core.http.HttpRuntime.init(transport.asTransport(), crypto.asProvider());
+        var probe = TracingProbe{};
+        var provider = try core.tracing.ExportingTracerProvider.init(
+            allocator,
+            std.testing.io,
+            runtime.crypto,
+            &probe.exporter,
+            .{},
+        );
+        defer provider.deinit() catch unreachable;
+        var pipeline = core.http.HttpPipeline.init(runtime, &.{});
+        var parent = core.tracing.TraceContext.parseTraceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01").?;
+        parent.trace_state = "vendor=value";
+        if (enabled) pipeline.setInstrumentation(.{
+            .provider = provider.asProvider(),
+            .scope_name = "caller.scope",
+            .scope_version = "caller-version",
+            .namespace = "Caller.Namespace",
+            .parent_context = parent,
+        });
+        var client = ConfigurationClient.init("https://configuration.azconfig.io", pipeline, .{});
+        pipeline.setInstrumentation(null);
+        const setting = try client.getSetting(allocator, "app.color", null);
+        defer setting.deinit(allocator);
+        try std.testing.expectEqualStrings("blue", setting.value.?);
+        try probe.capture(&transport, enabled);
+
+        var pager = try client.listSettings(allocator, "app.*");
+        defer pager.deinit();
+        client.pipeline.setInstrumentation(null);
+        for (0..2) |index| {
+            transport.response_body = if (index == 0)
+                \\{"items":[{"key":"app.color","value":"blue"}],"@nextLink":"https://configuration.azconfig.io/kv?after=1"}
+            else
+                \\{"items":[{"key":"app.size","value":"large"}]}
+            ;
+            const page = (try pager.next()) orelse return error.ExpectedPage;
+            defer {
+                for (page) |entry| {
+                    allocator.free(entry.key);
+                    entry.deinit(allocator);
+                }
+                allocator.free(page);
+            }
+            try std.testing.expectEqual(@as(usize, 1), page.len);
+            try std.testing.expectEqualStrings(if (index == 0) "app.color" else "app.size", page[0].key);
+            try probe.capture(&transport, enabled);
+        }
+        try std.testing.expect((try pager.next()) == null);
+        const expected: usize = if (enabled) 3 else 0;
+        try std.testing.expectEqual(@as(usize, 3), transport.call_count);
+        try std.testing.expectEqual(@as(usize, 0), probe.exported);
+        try std.testing.expectEqual(expected, provider.stats().queued_spans);
+        try std.testing.expectEqual(@as(usize, 0), provider.stats().active_spans);
+        try std.testing.expect(!provider.closed);
+        try provider.forceFlush(1000);
+        try std.testing.expectEqual(expected, probe.exported);
+        try std.testing.expectEqual(@as(u64, expected), provider.stats().started);
+        try std.testing.expectEqual(@as(u64, expected), provider.stats().ended);
+        try provider.shutdown(1000);
+    }
 }
