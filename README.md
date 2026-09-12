@@ -70,9 +70,9 @@ for that lifetime too. Clients never drain, flush, shut down or deinitialize
 providers. The application explicitly calls Core
 [`ExportingTracerProvider`](https://github.com/cataggar/azure-sdk-for-zig/blob/azure_sdk_core/v0.4.0/tracing/README.md)
 `drain(timeout_ms)`, `forceFlush(timeout_ms)` and `shutdown(timeout_ms)` as
-appropriate; there is no hidden worker or network exporter. Automatic HTTP
-spans end at response headers, not after streaming body consumption or result
-parsing. Per-call context parameters remain deferred to
+appropriate; there is no hidden worker or network exporter. Core streaming
+spans end at response headers, not after body consumption; SDK result parsing
+is outside the HTTP span. Per-call context parameters remain deferred to
 [#465](https://github.com/cataggar/azure-sdk-for-zig/issues/465).
 
 ## Development
