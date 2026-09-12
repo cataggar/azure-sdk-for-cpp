@@ -5,9 +5,9 @@ playback HTTP transports.
 
 - Source: repository root on the `sdk/testing` package branch
 - Release branch: `sdk/testing`
-- Version: `0.2.0`
-- Internal dependency: `azure_sdk_core` 0.3.0 at
-  `bc77bcacbb64af935ca53d60bf8a351c9592bc41`
+- Version: `0.3.0`
+- Internal dependency: `azure_sdk_core` 0.4.0 at
+  `be32073994f37422f2f6b5e9255d208b1284de85`
 
 Transport descriptors are copied by value while their contexts are borrowed.
 Keep playback/recording transport values, wrapped transport contexts, crypto
@@ -31,6 +31,16 @@ Playback validates method, exact URL, body presence/content, and every
 recorded request header. Additional live request headers are allowed so
 volatile telemetry can be omitted from recordings. Response header order and
 duplicates are preserved.
+
+This compatibility release adopts Core's owned `RequestHeaders`. Request
+snapshots still allocate independent header name/value copies, including
+`traceparent` and `tracestate`, and remain valid after the original request is
+mutated or destroyed. Response and capture-map ownership has not changed.
+Testing supplies transports, not a service HTTP client: it adds no
+instrumentation options or automatic spans. Configure tracing on the caller's
+Core pipeline; the caller owns the provider and its flush/shutdown lifecycle.
+Recording captures the propagated headers at dispatch and preserves its
+existing volatile-header redaction behavior.
 
 `RecordingTransport.toJson` emits version 3 recordings. Version 3 records a
 stable outcome stage and error category for transport/send, open, response-body,
