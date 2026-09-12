@@ -52,9 +52,9 @@ shut down or deinitialize the provider. For Core's
 [`ExportingTracerProvider`](https://github.com/cataggar/azure-sdk-for-zig/blob/azure_sdk_core/v0.4.0/tracing/README.md),
 the application explicitly calls bounded `drain(timeout_ms)`,
 `forceFlush(timeout_ms)` and `shutdown(timeout_ms)` as appropriate. There is no
-hidden export worker or network exporter. Automatic HTTP spans end at response
-headers, not after streaming body consumption or application parsing. Per-call
-context parameters remain deferred to
+hidden export worker or network exporter. Core streaming spans end at response
+headers, not after body consumption; SDK result parsing is outside the HTTP
+span. Per-call context parameters remain deferred to
 [#465](https://github.com/cataggar/azure-sdk-for-zig/issues/465).
 
 ## Driver boundary decision (#145)
